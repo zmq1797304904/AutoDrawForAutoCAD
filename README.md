@@ -44,12 +44,12 @@ pip install opencv-python==4.10.0.84 pytesseract numpy==1.26.4 pywin32
 
 ```powershell
 conda activate AutoDrawForAutoCAD
-python piliangshibie.py
+python AutoDraw.py
 ```
 
 按提示依次选择照片文件夹（支持 png / jpg / jpeg / bmp）和 DWG 文件即可。
 
-## 关键参数（piliangshibie.py 顶部）
+## 关键参数（AutoDraw.py 顶部）
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
