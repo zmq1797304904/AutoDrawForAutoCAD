@@ -1,0 +1,230 @@
+# -*- coding: utf-8 -*-
+import cv2
+import numpy as np
+import pytesseract
+import re
+import os
+import tkinter as tk
+from tkinter import filedialog
+import time
+import win32com.client
+import pythoncom
+
+# 1. 配置 Tesseract 路径
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+# 若系统 Tesseract 未安装中文语言包，则自动使用项目自带 tessdata 目录（含 chi_sim）
+_LOCAL_TESSDATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tessdata')
+if os.path.isdir(_LOCAL_TESSDATA) and 'chi_sim.traineddata' in os.listdir(_LOCAL_TESSDATA):
+    os.environ['TESSDATA_PREFIX'] = _LOCAL_TESSDATA
+
+# 绘图参数
+CIRCLE_RADIUS = 0.5   # 圆半径 0.5m
+CIRCLE_COLOR = 1      # AutoCAD 颜色索引：1=红(acRed)
+# 圆心坐标映射：东坐标 -> X，北坐标 -> Y；平面绘图 Z 固定为 0
+POINT_Z = 0.0
+
+
+def preprocess_image(image_path):
+    """主预处理：放大、去噪、二值化"""
+    img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    gray = cv2.resize(gray, (w * 3, h * 3), interpolation=cv2.INTER_LANCZOS4)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary
+
+
+def preprocess_image_alt(image_path):
+    """备用预处理：三次立方放大 + 锐化 + 二值化（针对失焦/模糊照片）"""
+    img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    sharpened = cv2.addWeighted(gray, 1.8, cv2.GaussianBlur(gray, (0, 0), 3), -0.8, 0)
+    _, binary = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary
+
+
+def extract_coords(image_path):
+    """从单张图片中提取坐标。
+
+    仪器屏幕的数值排列顺序为：东坐标(Y) -> 北坐标(X) -> 高程，
+    因此取筛选后最后三个数依次作为 东坐标、北坐标、高程。
+    """
+    try:
+        primary = preprocess_image(image_path)
+        alt = preprocess_image_alt(image_path)
+
+        # OCR 尝试通道：(图像, 语言, 分页模式)；任一通道得到 >=3 个大数即采用
+        attempts = []
+        if primary is not None:
+            attempts.append((primary, 'chi_sim+eng', ''))
+        if alt is not None:
+            attempts.append((alt, 'eng', '--psm 4'))
+            attempts.append((alt, 'eng', '--psm 6'))
+        if primary is not None:
+            attempts.append((primary, 'eng', '--psm 4'))
+        if not attempts:
+            return None
+
+        best_numbers = []
+        for img, lang, config in attempts:
+            text = pytesseract.image_to_string(img, lang=lang, config=config)
+            # 提取所有带小数点的数字，并筛选绝对值大于 100 的项
+            all_numbers = re.findall(r'-?\d+\.\d+', text)
+            valid_coords = [n for n in all_numbers if abs(float(n)) > 100]
+            if len(valid_coords) >= 3:
+                break
+            if len(valid_coords) > len(best_numbers):
+                best_numbers = valid_coords
+        else:
+            valid_coords = best_numbers
+
+        if len(valid_coords) >= 3:
+            # 统一保留小数点后三位（毫米精度）
+            return {
+                "文件名": os.path.basename(image_path),
+                "东坐标": f"{float(valid_coords[-3]):.3f}",
+                "北坐标": f"{float(valid_coords[-2]):.3f}",
+                "高程": f"{float(valid_coords[-1]):.3f}"
+            }
+        else:
+            return {"文件名": os.path.basename(image_path), "东坐标": "识别失败", "北坐标": "识别失败",
+                    "高程": "识别失败"}
+
+    except Exception as e:
+        return {"文件名": os.path.basename(image_path), "东坐标": f"报错: {e}", "北坐标": "",
+                "高程": ""}
+
+
+def draw_circles_on_dwg(dwg_path, points):
+    """打开指定 DWG 文件，在每个坐标点绘制红色圆。
+
+    points: [(东坐标X, 北坐标Y, 文件名), ...]
+    坐标系：东坐标 -> CAD 的 X 轴，北坐标 -> CAD 的 Y 轴
+    """
+    abs_dwg = os.path.abspath(dwg_path)
+
+    # 连接（或启动）AutoCAD
+    acad = win32com.client.Dispatch("AutoCAD.Application")
+    acad.Visible = True
+
+    # 若该图纸已在 AutoCAD 中打开则直接激活，否则重新打开
+    doc = None
+    for open_doc in acad.Documents:
+        try:
+            if os.path.abspath(open_doc.FullName).lower() == abs_dwg.lower():
+                doc = open_doc
+                break
+        except Exception:
+            continue
+    if doc is None:
+        # win32com 动态分发下 Open 的返回值不可靠（会拿到方法包装对象），
+        # 显式标记为方法后调用，再从 ActiveDocument / Documents 集合取回文档对象
+        acad.Documents._FlagAsMethod("Open")
+        acad.Documents.Open(abs_dwg)
+        for _ in range(60):
+            try:
+                active = acad.ActiveDocument
+                if os.path.abspath(active.FullName).lower() == abs_dwg.lower():
+                    doc = active
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        if doc is None:
+            for open_doc in acad.Documents:
+                if os.path.abspath(open_doc.FullName).lower() == abs_dwg.lower():
+                    doc = open_doc
+                    break
+    doc.Activate()
+
+    model_space = doc.ModelSpace
+    drawn = 0
+    for easting, northing, source_file in points:
+        # COM 需要传 VARIANT 双精度三维数组
+        center = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_R8,
+            (float(easting), float(northing), POINT_Z)
+        )
+        circle = model_space.AddCircle(center, CIRCLE_RADIUS)
+        circle.color = CIRCLE_COLOR   # 红色
+        circle.Update()
+        drawn += 1
+        print(f"   ✅ 已绘制圆: X(东)={easting}  Y(北)={northing}  <- {source_file}")
+
+    acad.ZoomExtents()
+    return drawn
+
+
+def batch_process():
+    """批量处理主程序：OCR 识别坐标 -> 在指定 DWG 上绘制红色圆"""
+    # 1. 弹出文件夹选择窗口
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    folder_path = filedialog.askdirectory(title="请选择包含坐标照片的文件夹")
+
+    if not folder_path:
+        print("未选择文件夹，程序退出。")
+        return
+
+    # 2. 立即选择要绘制的 DWG 文件（在 OCR 开始前选好，无需等待识别完成）
+    dwg_path = filedialog.askopenfilename(
+        title="请选择要在上面绘制圆的 .dwg 文件",
+        filetypes=[("DWG 文件", "*.dwg"), ("所有文件", "*.*")]
+    )
+    if not dwg_path:
+        print("未选择 DWG 文件，程序退出。")
+        return
+
+    # 3. 遍历文件夹中的图片并识别坐标（识别期间无需人工等待操作）
+    supported_formats = ('.png', '.jpg', '.jpeg', '.bmp')
+    print(f"\n🚀 正在处理文件夹: {folder_path}\n{'=' * 50}")
+
+    valid_points = []   # [(东坐标, 北坐标, 文件名), ...]
+    for filename in os.listdir(folder_path):
+        if filename.lower().endswith(supported_formats):
+            full_path = os.path.join(folder_path, filename)
+            result = extract_coords(full_path)
+
+            # 4. 打印识别结果
+            print(f"📄 文件: {result['文件名']}")
+            print(f"   北坐标: {result['北坐标']}")
+            print(f"   东坐标: {result['东坐标']}")
+            print(f"   高  程: {result['高程']}")
+            print("-" * 50)
+
+            # 5. 收集识别成功的有效坐标（东坐标=X，北坐标=Y）
+            try:
+                easting = float(result["东坐标"])
+                northing = float(result["北坐标"])
+                valid_points.append((easting, northing, result["文件名"]))
+            except (ValueError, TypeError):
+                continue
+
+    if not valid_points:
+        print("\n⚠️ 没有识别到可用坐标，无需绘图，程序结束。")
+        return
+
+    # 6. 打开 DWG 并绘制红色圆
+    print(f"\n📌 共识别到 {len(valid_points)} 组有效坐标。")
+    print(f"🎯 正在 AutoCAD 中打开图纸并绘制圆(半径 {CIRCLE_RADIUS}m，红色)...\n{'=' * 50}")
+    try:
+        count = draw_circles_on_dwg(dwg_path, valid_points)
+        print("=" * 50)
+        print(f"🎉 完成！共绘制 {count} 个红色圆。图纸保持打开状态，确认无误后请自行保存(Ctrl+S)。")
+    except Exception as e:
+        print(f"❌ AutoCAD 绘图失败: {e}")
+        print("请确认本机已安装 AutoCAD，且 DWG 文件未被其他程序独占占用。")
+
+
+if __name__ == "__main__":
+    batch_process()
