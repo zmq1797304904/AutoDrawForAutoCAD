@@ -1,0 +1,23 @@
+# ===== 实测图纸与业务数据（大文件不入库） =====
+实测图/
+
+# ===== Python 临时产物 =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# ===== IDE / 编辑器配置 =====
+.vscode/
+.idea/
+
+# ===== 操作系统临时文件 =====
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ===== 日志 =====
+*.log
