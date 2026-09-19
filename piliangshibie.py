@@ -24,6 +24,15 @@ CIRCLE_COLOR = 1      # AutoCAD 颜色索引：1=红(acRed)
 # 圆心坐标映射：东坐标 -> X，北坐标 -> Y；平面绘图 Z 固定为 0
 POINT_Z = 0.0
 
+# 图层与高程文字标注参数
+LAYER_CIRCLE = '长崖边巷道'             # 圆所在图层（不存在则自动创建）
+LAYER_TEXT = '长崖边巷道高程文字标注'    # 高程文字所在图层（不存在则自动创建）
+TEXT_HEIGHT = 0.8        # 文字高度
+TEXT_WIDTH_FACTOR = 0.8  # 文字宽度因子
+TEXT_COLOR = 3           # AutoCAD 颜色索引：3=绿(acGreen)
+TEXT_STYLE = 'Standard'  # 文字样式
+ZOOM_MARGIN = 5.0        # 绘制完成后视图缩放到绘制区域时的外扩边距（米）
+
 
 def preprocess_image(image_path):
     """主预处理：放大、去噪、二值化"""
@@ -104,10 +113,55 @@ def extract_coords(image_path):
                 "高程": ""}
 
 
-def draw_circles_on_dwg(dwg_path, points):
-    """打开指定 DWG 文件，在每个坐标点绘制红色圆。
+def _ensure_layer(doc, layer_name):
+    """获取指定图层，不存在则自动创建"""
+    try:
+        return doc.Layers.Item(layer_name)
+    except Exception:
+        return doc.Layers.Add(layer_name)
 
-    points: [(东坐标X, 北坐标Y, 文件名), ...]
+
+def _draw_on_doc(doc, points):
+    """在给定文档上绘制圆与高程文字标注，返回绘制数量。
+
+    points: [(东坐标X, 北坐标Y, 高程, 文件名), ...]
+    """
+    _ensure_layer(doc, LAYER_CIRCLE)
+    _ensure_layer(doc, LAYER_TEXT)
+
+    model_space = doc.ModelSpace
+    drawn = 0
+    for easting, northing, elevation, source_file in points:
+        # ---- 红色圆（图层：长崖边巷道）----
+        center = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_R8,
+            (float(easting), float(northing), POINT_Z)
+        )
+        circle = model_space.AddCircle(center, CIRCLE_RADIUS)
+        circle.Layer = LAYER_CIRCLE
+        circle.color = CIRCLE_COLOR   # 红色
+        circle.Update()
+
+        # ---- 高程文字（图层：长崖边巷道高程文字标注，绿色，与圆重叠居中）----
+        text_obj = model_space.AddText(f"{elevation:.3f}", center, TEXT_HEIGHT)
+        text_obj.Layer = LAYER_TEXT
+        text_obj.color = TEXT_COLOR      # 绿色
+        text_obj.StyleName = TEXT_STYLE
+        text_obj.ScaleFactor = TEXT_WIDTH_FACTOR
+        text_obj.HorizontalAlignment = 4  # acHorizontalAlignmentMiddle：以对齐点为文字中心
+        text_obj.TextAlignmentPoint = center
+        text_obj.Update()
+
+        drawn += 1
+        print(f"   ✅ 已绘制圆+高程标注: X(东)={easting}  Y(北)={northing}  高程={elevation}  <- {source_file}")
+
+    return drawn
+
+
+def draw_circles_on_dwg(dwg_path, points):
+    """打开指定 DWG 文件，在每个坐标点绘制红色圆并标注高程文字。
+
+    points: [(东坐标X, 北坐标Y, 高程, 文件名), ...]
     坐标系：东坐标 -> CAD 的 X 轴，北坐标 -> CAD 的 Y 轴
     """
     abs_dwg = os.path.abspath(dwg_path)
@@ -146,21 +200,23 @@ def draw_circles_on_dwg(dwg_path, points):
                     break
     doc.Activate()
 
-    model_space = doc.ModelSpace
-    drawn = 0
-    for easting, northing, source_file in points:
-        # COM 需要传 VARIANT 双精度三维数组
-        center = win32com.client.VARIANT(
-            pythoncom.VT_ARRAY | pythoncom.VT_R8,
-            (float(easting), float(northing), POINT_Z)
-        )
-        circle = model_space.AddCircle(center, CIRCLE_RADIUS)
-        circle.color = CIRCLE_COLOR   # 红色
-        circle.Update()
-        drawn += 1
-        print(f"   ✅ 已绘制圆: X(东)={easting}  Y(北)={northing}  <- {source_file}")
+    drawn = _draw_on_doc(doc, points)
 
-    acad.ZoomExtents()
+    # 视图缩放到本次绘制的区域（外扩 ZOOM_MARGIN 米），而不是整张图，
+    # 避免 ZoomExtents 把大坐标图纸缩得过小、难以确认刚绘制的点
+    if points:
+        xs = [pt[0] for pt in points]
+        ys = [pt[1] for pt in points]
+        margin = ZOOM_MARGIN
+        lower = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_R8,
+            (min(xs) - margin, min(ys) - margin, POINT_Z)
+        )
+        upper = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_R8,
+            (max(xs) + margin, max(ys) + margin, POINT_Z)
+        )
+        acad.ZoomWindow(lower, upper)
     return drawn
 
 
@@ -189,7 +245,7 @@ def batch_process():
     supported_formats = ('.png', '.jpg', '.jpeg', '.bmp')
     print(f"\n🚀 正在处理文件夹: {folder_path}\n{'=' * 50}")
 
-    valid_points = []   # [(东坐标, 北坐标, 文件名), ...]
+    valid_points = []   # [(东坐标, 北坐标, 高程, 文件名), ...]
     for filename in os.listdir(folder_path):
         if filename.lower().endswith(supported_formats):
             full_path = os.path.join(folder_path, filename)
@@ -202,11 +258,12 @@ def batch_process():
             print(f"   高  程: {result['高程']}")
             print("-" * 50)
 
-            # 5. 收集识别成功的有效坐标（东坐标=X，北坐标=Y）
+            # 5. 收集识别成功的有效坐标（东坐标=X，北坐标=Y，高程用于文字标注）
             try:
                 easting = float(result["东坐标"])
                 northing = float(result["北坐标"])
-                valid_points.append((easting, northing, result["文件名"]))
+                elevation = float(result["高程"])
+                valid_points.append((easting, northing, elevation, result["文件名"]))
             except (ValueError, TypeError):
                 continue
 
