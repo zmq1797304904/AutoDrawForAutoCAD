@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import cv2
 import numpy as np
-import pytesseract
 import re
 import os
 import shutil
@@ -12,13 +11,8 @@ import time
 import win32com.client
 import pythoncom
 
-# 1. 配置 Tesseract 路径
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-# 若系统 Tesseract 未安装中文语言包，则自动使用项目自带 tessdata 目录（含 chi_sim）
-_LOCAL_TESSDATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tessdata')
-if os.path.isdir(_LOCAL_TESSDATA) and 'chi_sim.traineddata' in os.listdir(_LOCAL_TESSDATA):
-    os.environ['TESSDATA_PREFIX'] = _LOCAL_TESSDATA
+# RapidOCR 引擎单例：模型只加载一次。首次运行会自动下载 ONNX 模型。
+_OCR_ENGINE = None
 
 # 绘图参数
 CIRCLE_RADIUS = 0.5   # 圆半径 0.5m
@@ -36,80 +30,98 @@ TEXT_STYLE = 'Standard'  # 文字样式
 ZOOM_MARGIN = 5.0        # 绘制完成后视图缩放到绘制区域时的外扩边距（米）
 
 
-def preprocess_image(image_path):
-    """主预处理：放大、去噪、二值化"""
-    img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        return None
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-    gray = cv2.resize(gray, (w * 3, h * 3), interpolation=cv2.INTER_LANCZOS4)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return binary
+def _get_ocr_engine():
+    """延迟初始化 RapidOCR，避免未选文件就加载模型。"""
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        from rapidocr import RapidOCR
+        _OCR_ENGINE = RapidOCR()
+    return _OCR_ENGINE
 
 
-def preprocess_image_alt(image_path):
-    """备用预处理：三次立方放大 + 锐化 + 二值化（针对失焦/模糊照片）"""
-    img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        return None
+def _load_bgr(image_path):
+    """用 numpy 读文件再解码，兼容中文路径。"""
+    return cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-    sharpened = cv2.addWeighted(gray, 1.8, cv2.GaussianBlur(gray, (0, 0), 3), -0.8, 0)
-    _, binary = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return binary
+
+def _enhance_for_blur(img):
+    """备用通道：放大 + 锐化（仍保持三通道，适配检测模型）。"""
+    h, w = img.shape[:2]
+    up = cv2.resize(img, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+    sharpened = cv2.addWeighted(gray, 1.6, cv2.GaussianBlur(gray, (0, 0), 2), -0.6, 0)
+    return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+
+
+def _reading_order_texts(result):
+    """按从上到下、从左到右排列识别结果，避免检测顺序打乱东/北/高程。"""
+    txts = getattr(result, "txts", None)
+    boxes = getattr(result, "boxes", None)
+    if not txts:
+        return []
+    if boxes is None:
+        return list(txts)
+
+    keyed = []
+    for box, txt in zip(boxes, txts):
+        arr = np.asarray(box, dtype=np.float64)
+        if arr.ndim == 2:
+            y = float(arr[:, 1].min())
+            x = float(arr[:, 0].min())
+        else:
+            y = float(arr.reshape(-1)[1])
+            x = float(arr.reshape(-1)[0])
+        keyed.append((y, x, txt))
+    keyed.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in keyed]
+
+
+def _normalize_ocr_text(text):
+    """全角数字/小数点转半角，便于后续正则提取。"""
+    trans = str.maketrans("０１２３４５６７８９．－", "0123456789.-")
+    return text.translate(trans)
+
+
+def _ocr_to_text(img):
+    result = _get_ocr_engine()(img)
+    return _normalize_ocr_text("\n".join(_reading_order_texts(result)))
+
+
+def _coords_from_text(text):
+    all_numbers = re.findall(r"-?\d+\.\d+", text)
+    return [n for n in all_numbers if abs(float(n)) > 100]
 
 
 def extract_coords(image_path):
     """从单张图片中提取坐标。
 
-    仪器屏幕的数值排列顺序为：东坐标(Y) -> 北坐标(X) -> 高程，
+    仪器屏幕的数值排列顺序为：东坐标 -> 北坐标 -> 高程，
     因此取筛选后最后三个数依次作为 东坐标、北坐标、高程。
     """
     try:
-        primary = preprocess_image(image_path)
-        alt = preprocess_image_alt(image_path)
-
-        # OCR 尝试通道：(图像, 语言, 分页模式)；任一通道得到 >=3 个大数即采用
-        attempts = []
-        if primary is not None:
-            attempts.append((primary, 'chi_sim+eng', ''))
-        if alt is not None:
-            attempts.append((alt, 'eng', '--psm 4'))
-            attempts.append((alt, 'eng', '--psm 6'))
-        if primary is not None:
-            attempts.append((primary, 'eng', '--psm 4'))
-        if not attempts:
+        img = _load_bgr(image_path)
+        if img is None:
             return {"文件名": os.path.basename(image_path), "东坐标": "识别失败",
                     "北坐标": "图片无法读取或已损坏", "高程": "识别失败"}
 
         best_numbers = []
-        for img, lang, config in attempts:
-            text = pytesseract.image_to_string(img, lang=lang, config=config)
-            # 提取所有带小数点的数字，并筛选绝对值大于 100 的项
-            all_numbers = re.findall(r'-?\d+\.\d+', text)
-            valid_coords = [n for n in all_numbers if abs(float(n)) > 100]
+        for candidate in (img, _enhance_for_blur(img)):
+            valid_coords = _coords_from_text(_ocr_to_text(candidate))
             if len(valid_coords) >= 3:
+                best_numbers = valid_coords
                 break
             if len(valid_coords) > len(best_numbers):
                 best_numbers = valid_coords
-        else:
-            valid_coords = best_numbers
 
-        if len(valid_coords) >= 3:
-            # 统一保留小数点后三位（毫米精度）
+        if len(best_numbers) >= 3:
             return {
                 "文件名": os.path.basename(image_path),
-                "东坐标": f"{float(valid_coords[-3]):.3f}",
-                "北坐标": f"{float(valid_coords[-2]):.3f}",
-                "高程": f"{float(valid_coords[-1]):.3f}"
+                "东坐标": f"{float(best_numbers[-3]):.3f}",
+                "北坐标": f"{float(best_numbers[-2]):.3f}",
+                "高程": f"{float(best_numbers[-1]):.3f}"
             }
-        else:
-            return {"文件名": os.path.basename(image_path), "东坐标": "识别失败", "北坐标": "识别失败",
-                    "高程": "识别失败"}
+        return {"文件名": os.path.basename(image_path), "东坐标": "识别失败", "北坐标": "识别失败",
+                "高程": "识别失败"}
 
     except Exception as e:
         return {"文件名": os.path.basename(image_path), "东坐标": f"报错: {e}", "北坐标": "",
@@ -299,6 +311,9 @@ def batch_process():
     if not dwg_path:
         print("未选择 DWG 文件，程序退出。")
         return
+
+    print("⏳ 正在加载 OCR 模型（首次运行会自动下载，请稍候）...")
+    _get_ocr_engine()
 
     # 3. 遍历文件夹中的图片并识别坐标（识别期间无需人工等待操作）
     supported_formats = ('.png', '.jpg', '.jpeg', '.bmp')

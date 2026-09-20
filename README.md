@@ -30,8 +30,8 @@
 ## 环境要求与安装
 
 - Windows + 本机已安装 **AutoCAD**（通过 COM 接口操控）
-- **Tesseract OCR**：默认安装在 `C:\Program Files\Tesseract-OCR`，且 `tessdata` 目录内需包含 `chi_sim` 简体中文语言包（脚本第 14 行可改路径）
-- Python 3.11，建议使用项目专用 conda 环境：
+- Python 3.11，建议使用项目专用 conda 环境
+- OCR 使用 **RapidOCR**（ONNX Runtime），`pip install` 即可，无需安装 Tesseract 等独立程序；首次识别会自动下载模型
 
 ```powershell
 # 创建并激活专用环境（环境名与项目同名）
@@ -39,7 +39,7 @@ conda create -n AutoDrawForAutoCAD python=3.11 -y
 conda activate AutoDrawForAutoCAD
 
 # 安装依赖（opencv 指定 4.10，与 numpy 1.26 兼容）
-pip install opencv-python==4.10.0.84 pytesseract numpy==1.26.4 pywin32
+pip install opencv-python==4.10.0.84 numpy==1.26.4 pywin32 rapidocr onnxruntime
 ```
 
 ## 使用方法
@@ -68,7 +68,8 @@ python AutoDraw.py
 
 ## 识别原理
 
-- **预处理双通道**：主通道（3 倍放大 + 高斯去噪 + Otsu 二值化）失败时，自动切换备用通道（三次立方放大 + 锐化 + psm4），专治失焦/模糊照片
+- **RapidOCR**：检测 + 识别，文本框按从上到下、从左到右排序后再拼接，避免检测顺序打乱东/北/高程
+- **预处理双通道**：先对原图识别；不足三个有效坐标时，再走放大 + 锐化备用通道（针对失焦/模糊照片）
 - **数字筛选**：从 OCR 结果中提取所有带小数的数字，仅保留绝对值 > 100 的项（过滤点号、日期等干扰），取最后三个作为东坐标、北坐标、高程
 - 使用 `np.fromfile + cv2.imdecode` 读取图片，兼容中文路径
 
@@ -77,4 +78,4 @@ python AutoDraw.py
 - 识别准确性依赖"坐标是屏幕上最后三个大数值小数"这一版式假设，其他版式的截图可能错位
 - 图纸单位需为**米**（0.5 半径才对应 0.5m）；毫米单位图纸请把 `CIRCLE_RADIUS`、`TEXT_HEIGHT`、`ZOOM_MARGIN` 等按比例放大
 - 对同一批照片重复运行会在相同位置叠加重复圆和文字（暂无去重保护）
-- Tesseract 路径为硬编码，换机安装位置不同时需修改脚本第 14 行
+- 首次运行需能访问网络以下载 RapidOCR 模型；之后使用本地缓存
