@@ -1,0 +1,5 @@
+opencv-python==4.10.0
+numpy==1.26.4
+pywin32==312
+rapidocr
+python-docx
