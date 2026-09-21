@@ -31,6 +31,17 @@ TEXT_STYLE = 'Standard'  # 文字样式
 ZOOM_MARGIN = 5.0        # 绘制完成后视图缩放到绘制区域时的外扩边距（米）
 
 
+def _trunc3(x):
+    """截断到小数点后 3 位（不四舍五入），返回字符串。
+
+    用字符串切片而非 round()，避免 343.4956 被四舍五入成 343.496。
+    取 10 位小数再切片，规避浮点数精度导致的截断错位。
+    """
+    s = f"{float(x):.10f}"
+    dot = s.index('.')
+    return s[:dot + 4]
+
+
 def _get_ocr_engine():
     """延迟初始化 RapidOCR，避免未选文件就加载模型。"""
     global _OCR_ENGINE
@@ -117,9 +128,9 @@ def extract_coords(image_path):
         if len(best_numbers) >= 3:
             return {
                 "文件名": os.path.basename(image_path),
-                "东坐标": f"{float(best_numbers[-3]):.3f}",
-                "北坐标": f"{float(best_numbers[-2]):.3f}",
-                "高程": f"{float(best_numbers[-1]):.3f}"
+                "东坐标": _trunc3(best_numbers[-3]),
+                "北坐标": _trunc3(best_numbers[-2]),
+                "高程": _trunc3(best_numbers[-1])
             }
         return {"文件名": os.path.basename(image_path), "东坐标": "识别失败", "北坐标": "识别失败",
                 "高程": "识别失败"}
@@ -164,7 +175,7 @@ def _draw_on_doc(doc, points):
             circle.Update()
 
             # ---- 高程文字（图层：长崖边巷道高程文字标注，绿色，与圆重叠居中）----
-            text_obj = model_space.AddText(f"{elevation:.3f}", center, TEXT_HEIGHT)
+            text_obj = model_space.AddText(_trunc3(elevation), center, TEXT_HEIGHT)
             text_obj.Layer = LAYER_TEXT
             text_obj.color = TEXT_COLOR      # 绿色
             text_obj.StyleName = TEXT_STYLE
