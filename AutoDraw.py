@@ -297,14 +297,17 @@ def extract_images_from_docx(docx_path, output_dir):
 
     返回 [(保存后的完整路径, 显示用文件名), ...]。
     文件名格式：{文档名(去扩展名)}_{序号:03d}.{扩展名}，便于追溯来源。
-    仅提取嵌入式图片（inline shapes），浮动图片暂不支持。
+
+    解析策略：
+    1. 优先用 python-docx 解析（能保证图片在文档中的出现顺序）；
+    2. 若文档结构不标准（如 WPS 生成的 docx 缺少 docProps/core.xml 导致
+       python-docx 无法打开），则回退到直接用 zipfile 解压 word/media/
+       目录，按文件名序号排序提取。
     """
     from docx import Document
     from docx.enum.shape import WD_INLINE_SHAPE
 
-    doc = Document(docx_path)
     doc_base = os.path.splitext(os.path.basename(docx_path))[0]
-    extracted = []
 
     # 内容类型到扩展名的映射
     ext_map = {
@@ -317,32 +320,75 @@ def extract_images_from_docx(docx_path, output_dir):
         'image/x-emf': '.emf',
         'image/x-wmf': '.wmf',
     }
+    # zip 内扩展名到 content_type 的反向映射（回退模式用）
+    zip_ext_map = {
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif', '.bmp': 'image/bmp', '.tiff': 'image/tiff',
+        '.emf': 'image/x-emf', '.wmf': 'image/x-wmf',
+    }
 
-    idx = 0
-    for shape in doc.inline_shapes:
-        # 只处理图片类型（忽略公式、图表等）
-        if shape.type != WD_INLINE_SHAPE.PICTURE:
-            continue
-        try:
-            image_part = shape._inline.graphic.graphicData.pic.blipFill.blip
-            rId = image_part.embed
-            image_part = doc.part.related_parts[rId]
-        except Exception:
-            # 兼容旧版结构，尝试直接取 image_part
-            try:
-                image_part = shape.image_part
-            except Exception:
-                continue
-
-        content_type = image_part.content_type
+    def _save_image(blob, content_type, idx):
         ext = ext_map.get(content_type, '.png')
-        idx += 1
         filename = f"{doc_base}_{idx:03d}{ext}"
         save_path = os.path.join(output_dir, filename)
         with open(save_path, 'wb') as f:
-            f.write(image_part.blob)
-        extracted.append((save_path, filename))
+            f.write(blob)
+        return (save_path, filename)
 
+    # ---- 策略1：python-docx（顺序可靠）----
+    try:
+        doc = Document(docx_path)
+        extracted = []
+        idx = 0
+        for shape in doc.inline_shapes:
+            # 只处理图片类型（忽略公式、图表等）
+            if shape.type != WD_INLINE_SHAPE.PICTURE:
+                continue
+            try:
+                image_part = shape._inline.graphic.graphicData.pic.blipFill.blip
+                rId = image_part.embed
+                image_part = doc.part.related_parts[rId]
+            except Exception:
+                try:
+                    image_part = shape.image_part
+                except Exception:
+                    continue
+            idx += 1
+            extracted.append(_save_image(image_part.blob, image_part.content_type, idx))
+        if extracted:
+            return extracted
+        # python-docx 打开成功但没找到图片，可能是浮动图片或空文档，
+        # 不立即返回，继续尝试回退策略以防遗漏
+    except Exception as e:
+        print(f"   ℹ️ python-docx 解析失败，尝试直接解压提取：{str(e)[:80]}")
+
+    # ---- 策略2：zipfile 直接解压 word/media/（兼容性优先）----
+    import zipfile
+    import re as _re
+    extracted = []
+    try:
+        with zipfile.ZipFile(docx_path, 'r') as z:
+            media_names = [n for n in z.namelist()
+                           if n.startswith('word/media/') and not n.endswith('/')]
+            # 按文件名中的数字序号排序，尽量还原插入顺序
+            def _sort_key(name):
+                m = _re.search(r'(\d+)', os.path.basename(name))
+                return (int(m.group(1)) if m else 9999, name)
+            media_names.sort(key=_sort_key)
+
+            idx = 0
+            for name in media_names:
+                ext = os.path.splitext(name)[1].lower()
+                if ext not in zip_ext_map:
+                    continue
+                idx += 1
+                blob = z.read(name)
+                extracted.append(_save_image(blob, zip_ext_map[ext], idx))
+    except Exception as e:
+        raise RuntimeError(f"无法从文档提取图片：{e}")
+
+    if not extracted:
+        print(f"   ⚠️ 文档中未找到任何嵌入式图片：{os.path.basename(docx_path)}")
     return extracted
 
 
