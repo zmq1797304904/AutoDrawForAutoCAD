@@ -544,8 +544,14 @@ def batch_process():
             reason = ("OCR识别异常: " + east) if east.startswith("报错") else "坐标识别失败（未提取到3个有效坐标值）"
             failures.append((full_path, filename, reason))
 
-    # 归档基础目录：优先用文件夹路径（有文件夹时），否则用临时目录（仅 docx 时）
-    archive_base = folder_path or temp_dir
+    # 归档基础目录：有文件夹用文件夹；仅 docx 时用第一个 docx 所在目录，
+    # 避免归档目录建在 temp_dir 内被清理时误删。
+    if folder_path:
+        archive_base = folder_path
+    elif docx_paths:
+        archive_base = os.path.dirname(os.path.abspath(docx_paths[0]))
+    else:
+        archive_base = None
 
     if not valid_points:
         print("\n⚠️ 没有识别到可用坐标，无需绘图。")
