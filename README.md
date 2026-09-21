@@ -5,10 +5,14 @@
 ## 功能流程
 
 ```
-选择坐标照片文件夹 → 选择目标 DWG 文件 → 自动 OCR 逐张识别 → 自动打开 AutoCAD 绘图
+选择坐标照片（文件夹 / 多个.docx 文档，可同时使用）→ 选择目标 DWG 文件 → 自动 OCR 逐张识别 → 自动打开 AutoCAD 绘图
 ```
 
-1. 运行后先弹出两个选择框（照片文件夹、目标 DWG），选完即可离开，识别与绘图全自动完成
+1. 运行后依次弹出三个选择框：
+   - **照片文件夹**（可取消，仅用 docx 时跳过）
+   - **一个或多个 .docx 文档**（可多选、可取消）——会按文档内图片出现顺序提取所有嵌入式截图
+   - **目标 DWG 文件**
+   选完即可离开，识别与绘图全自动完成
 2. 每张照片识别出 **东坐标 / 北坐标 / 高程** 三项（保留小数点后 3 位，毫米精度），实时打印在控制台供核对
 3. 识别成功的每组坐标绘制两个实体（识别失败的照片自动跳过，不会画错点）：
    - **红色圆**：半径 0.5m，图层为 **长崖边巷道**（图层不存在时自动创建）
@@ -39,7 +43,7 @@ conda create -n AutoDrawForAutoCAD python=3.11 -y
 conda activate AutoDrawForAutoCAD
 
 # 安装依赖（opencv 指定 4.10，与 numpy 1.26 兼容）
-pip install opencv-python==4.10.0.84 numpy==1.26.4 pywin32 rapidocr onnxruntime
+pip install opencv-python==4.10.0.84 numpy==1.26.4 pywin32 rapidocr onnxruntime python-docx
 ```
 
 ## 使用方法

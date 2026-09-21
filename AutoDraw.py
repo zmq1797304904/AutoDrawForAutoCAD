@@ -4,6 +4,7 @@ import numpy as np
 import re
 import os
 import shutil
+import tempfile
 from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -291,19 +292,84 @@ def archive_failed_images(folder_path, failures):
     return archive_dir
 
 
+def extract_images_from_docx(docx_path, output_dir):
+    """从 docx 文档中按出现顺序提取所有嵌入式图片到 output_dir。
+
+    返回 [(保存后的完整路径, 显示用文件名), ...]。
+    文件名格式：{文档名(去扩展名)}_{序号:03d}.{扩展名}，便于追溯来源。
+    仅提取嵌入式图片（inline shapes），浮动图片暂不支持。
+    """
+    from docx import Document
+    from docx.enum.shape import WD_INLINE_SHAPE
+
+    doc = Document(docx_path)
+    doc_base = os.path.splitext(os.path.basename(docx_path))[0]
+    extracted = []
+
+    # 内容类型到扩展名的映射
+    ext_map = {
+        'image/png': '.png',
+        'image/jpeg': '.jpg',
+        'image/jpg': '.jpg',
+        'image/gif': '.gif',
+        'image/bmp': '.bmp',
+        'image/tiff': '.tiff',
+        'image/x-emf': '.emf',
+        'image/x-wmf': '.wmf',
+    }
+
+    idx = 0
+    for shape in doc.inline_shapes:
+        # 只处理图片类型（忽略公式、图表等）
+        if shape.type != WD_INLINE_SHAPE.PICTURE:
+            continue
+        try:
+            image_part = shape._inline.graphic.graphicData.pic.blipFill.blip
+            rId = image_part.embed
+            image_part = doc.part.related_parts[rId]
+        except Exception:
+            # 兼容旧版结构，尝试直接取 image_part
+            try:
+                image_part = shape.image_part
+            except Exception:
+                continue
+
+        content_type = image_part.content_type
+        ext = ext_map.get(content_type, '.png')
+        idx += 1
+        filename = f"{doc_base}_{idx:03d}{ext}"
+        save_path = os.path.join(output_dir, filename)
+        with open(save_path, 'wb') as f:
+            f.write(image_part.blob)
+        extracted.append((save_path, filename))
+
+    return extracted
+
+
 def batch_process():
-    """批量处理主程序：OCR 识别坐标 -> 在指定 DWG 上绘制红色圆"""
-    # 1. 弹出文件夹选择窗口
+    """批量处理主程序：OCR 识别坐标 -> 在指定 DWG 上绘制红色圆
+
+    图片来源支持两种（可同时使用）：
+    1. 一个文件夹内的所有图片
+    2. 一个或多个 .docx 文档中嵌入的图片（按出现顺序提取）
+    """
+    # 1. 弹出文件夹选择窗口（可取消，仅用 docx 时留空）
     root = tk.Tk()
     root.withdraw()
     root.attributes('-topmost', True)
-    folder_path = filedialog.askdirectory(title="请选择包含坐标照片的文件夹")
+    folder_path = filedialog.askdirectory(title="请选择包含坐标照片的文件夹（可取消，仅用 docx 时跳过）")
 
-    if not folder_path:
-        print("未选择文件夹，程序退出。")
+    # 2. 选择 .docx 文档（可多选，可取消）
+    docx_paths = filedialog.askopenfilenames(
+        title="请选择包含坐标照片的 .docx 文档（可多选，可取消）",
+        filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")]
+    )
+
+    if not folder_path and not docx_paths:
+        print("未选择任何图片来源（文件夹或 docx），程序退出。")
         return
 
-    # 2. 立即选择要绘制的 DWG 文件（在 OCR 开始前选好，无需等待识别完成）
+    # 3. 立即选择要绘制的 DWG 文件（在 OCR 开始前选好，无需等待识别完成）
     dwg_path = filedialog.askopenfilename(
         title="请选择要在上面绘制圆的 .dwg 文件",
         filetypes=[("DWG 文件", "*.dwg"), ("所有文件", "*.*")]
@@ -315,49 +381,77 @@ def batch_process():
     print("⏳ 正在加载 OCR 模型（首次运行会自动下载，请稍候）...")
     _get_ocr_engine()
 
-    # 3. 遍历文件夹中的图片并识别坐标（识别期间无需人工等待操作）
+    # 4. 收集所有待处理图片：[(完整路径, 显示文件名), ...]
+    #    先收集文件夹内图片，再提取 docx 内图片
     supported_formats = ('.png', '.jpg', '.jpeg', '.bmp')
-    print(f"\n🚀 正在处理文件夹: {folder_path}\n{'=' * 50}")
+    image_list = []   # [(完整路径, 显示文件名), ...]
+    temp_dir = None   # docx 提取图片的临时目录，结束时清理
+
+    if folder_path:
+        for filename in sorted(os.listdir(folder_path)):
+            if filename.lower().endswith(supported_formats):
+                image_list.append((os.path.join(folder_path, filename), filename))
+        print(f"\n📁 文件夹图片：{len(image_list)} 张")
+
+    if docx_paths:
+        temp_dir = tempfile.mkdtemp(prefix='autodraw_docx_')
+        for docx_path in docx_paths:
+            try:
+                imgs = extract_images_from_docx(docx_path, temp_dir)
+                image_list.extend(imgs)
+                print(f"📄 {os.path.basename(docx_path)}：提取到 {len(imgs)} 张图片")
+            except Exception as e:
+                print(f"⚠️ 读取 docx 失败 {os.path.basename(docx_path)}: {e}")
+
+    if not image_list:
+        print("\n⚠️ 未收集到任何图片，程序结束。")
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return
+
+    print(f"\n🚀 共收集 {len(image_list)} 张图片，开始识别...\n{'=' * 50}")
 
     valid_points = []   # [(东坐标, 北坐标, 高程, 文件名), ...]
     failures = []       # [(图片完整路径, 文件名, 失败原因), ...]
-    total_images = 0
-    for filename in os.listdir(folder_path):
-        if filename.lower().endswith(supported_formats):
-            total_images += 1
-            full_path = os.path.join(folder_path, filename)
-            result = extract_coords(full_path)
+    total_images = len(image_list)
+    for full_path, filename in image_list:
+        result = extract_coords(full_path)
 
-            # 4. 打印识别结果
-            print(f"📄 文件: {result['文件名']}")
-            print(f"   北坐标: {result['北坐标']}")
-            print(f"   东坐标: {result['东坐标']}")
-            print(f"   高  程: {result['高程']}")
-            print("-" * 50)
+        # 5. 打印识别结果
+        print(f"📄 文件: {result['文件名']}")
+        print(f"   北坐标: {result['北坐标']}")
+        print(f"   东坐标: {result['东坐标']}")
+        print(f"   高  程: {result['高程']}")
+        print("-" * 50)
 
-            # 5. 收集识别成功的有效坐标（东坐标=X，北坐标=Y，高程用于文字标注）
-            try:
-                easting = float(result["东坐标"])
-                northing = float(result["北坐标"])
-                elevation = float(result["高程"])
-                valid_points.append((easting, northing, elevation, result["文件名"]))
-            except (ValueError, TypeError):
-                # 识别失败或报错：记录原因，稍后统一归档
-                east = str(result.get("东坐标", ""))
-                reason = ("OCR识别异常: " + east) if east.startswith("报错") else "坐标识别失败（未提取到3个有效坐标值）"
-                failures.append((full_path, filename, reason))
+        # 6. 收集识别成功的有效坐标（东坐标=X，北坐标=Y，高程用于文字标注）
+        try:
+            easting = float(result["东坐标"])
+            northing = float(result["北坐标"])
+            elevation = float(result["高程"])
+            valid_points.append((easting, northing, elevation, filename))
+        except (ValueError, TypeError):
+            # 识别失败或报错：记录原因，稍后统一归档
+            east = str(result.get("东坐标", ""))
+            reason = ("OCR识别异常: " + east) if east.startswith("报错") else "坐标识别失败（未提取到3个有效坐标值）"
+            failures.append((full_path, filename, reason))
+
+    # 归档基础目录：优先用文件夹路径（有文件夹时），否则用临时目录（仅 docx 时）
+    archive_base = folder_path or temp_dir
 
     if not valid_points:
         print("\n⚠️ 没有识别到可用坐标，无需绘图。")
-        archive_dir = archive_failed_images(folder_path, failures)
+        archive_dir = archive_failed_images(archive_base, failures) if archive_base else None
         msg = f"共扫描 {total_images} 张图片，未识别到任何可用坐标。"
         if archive_dir:
             msg += f"\n失败图片已保存至:\n{archive_dir}"
         print(msg)
         messagebox.showwarning("处理完成（无有效坐标）", msg, parent=root)
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         return
 
-    # 6. 打开 DWG 并绘制红色圆
+    # 7. 打开 DWG 并绘制红色圆
     print(f"\n📌 共识别到 {len(valid_points)} 组有效坐标。")
     print(f"🎯 正在 AutoCAD 中打开图纸并绘制圆(半径 {CIRCLE_RADIUS}m，红色)...\n{'=' * 50}")
 
@@ -378,16 +472,17 @@ def batch_process():
 
     # 合并 OCR 失败与绘制失败的图片（按文件名去重）
     existing = {name for _, name, _ in failures}
-    name_to_path = {pt[3]: os.path.join(folder_path, pt[3]) for pt in valid_points}
+    # 建立 文件名 -> 完整路径 的映射（含文件夹图片和 docx 临时图片）
+    name_to_path = {fn: fp for fp, fn in image_list}
     for failed_name, reason in draw_failed:
         if failed_name not in existing:
             failures.append((name_to_path.get(failed_name, failed_name), failed_name, reason))
             existing.add(failed_name)
 
-    # 7. 归档失败图片
-    archive_dir = archive_failed_images(folder_path, failures)
+    # 8. 归档失败图片
+    archive_dir = archive_failed_images(archive_base, failures) if archive_base else None
 
-    # 8. 弹窗汇总结果
+    # 9. 弹窗汇总结果
     print("=" * 50)
     print(f"🎉 处理结束：共 {total_images} 张，成功 {count} 个，失败 {len(failures)} 个。")
     if archive_dir:
@@ -395,7 +490,7 @@ def batch_process():
     print("📝 图纸保持打开状态，确认无误后请自行保存(Ctrl+S)。")
 
     if cad_fatal:
-        msg = f"AutoCAD 绘图失败：{cad_fatal}\n\n失败图片已保存至:\n{archive_dir or folder_path}"
+        msg = f"AutoCAD 绘图失败：{cad_fatal}\n\n失败图片已保存至:\n{archive_dir or archive_base}"
         messagebox.showerror("处理异常", msg, parent=root)
     else:
         msg = f"处理完成！\n\n共扫描图片：{total_images} 张\n成功绘制：{count} 个\n失败：{len(failures)} 个"
@@ -406,6 +501,10 @@ def batch_process():
             messagebox.showwarning("处理完成（存在失败项）", msg, parent=root)
         else:
             messagebox.showinfo("处理完成", msg, parent=root)
+
+    # 清理 docx 临时提取目录（失败图片已复制到归档目录，原临时文件可删）
+    if temp_dir:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
