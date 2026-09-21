@@ -21,4 +21,4 @@ jobs:
           spec: 'AutoDraw.py'
           requirements: 'requirements.txt'
           upload_exe_with_name: 'AutoDraw'
-          options: --onefile, --name "AutoDraw", --windowed, --collect-all rapidocr, --collect-all onnxruntime
+          options: --onefile, --name "AutoDraw", --windowed, --collect-all rapidocr, --collect-all onnxruntime, --hidden-import onnxruntime, --hidden-import onnxruntime.capi, --collect-submodules onnxruntime
