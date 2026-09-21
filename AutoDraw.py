@@ -403,28 +403,79 @@ def extract_images_from_docx(docx_path, output_dir):
     return extracted
 
 
+def _ask_source_type(root):
+    """弹窗让用户选择图片来源类型，返回 'folder' 或 'docx'，取消返回 None。"""
+    choice = {'value': None}
+    win = tk.Toplevel(root)
+    win.title("选择图片来源")
+    win.attributes('-topmost', True)
+    win.resizable(False, False)
+
+    tk.Label(win, text="请选择坐标照片的来源：", font=("Microsoft YaHei", 11),
+             padx=30, pady=20).pack()
+
+    btn_frame = tk.Frame(win)
+    btn_frame.pack(pady=(0, 20))
+
+    def pick_folder():
+        choice['value'] = 'folder'
+        win.destroy()
+
+    def pick_docx():
+        choice['value'] = 'docx'
+        win.destroy()
+
+    tk.Button(btn_frame, text="📁 图片文件夹", font=("Microsoft YaHei", 11),
+              width=16, height=2, command=pick_folder).pack(side=tk.LEFT, padx=10)
+    tk.Button(btn_frame, text="📄 Word 文档(.docx)", font=("Microsoft YaHei", 11),
+              width=16, height=2, command=pick_docx).pack(side=tk.LEFT, padx=10)
+
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
+    win.update_idletasks()
+    # 居中
+    x = (win.winfo_screenwidth() - win.winfo_reqwidth()) // 2
+    y = (win.winfo_screenheight() - win.winfo_reqheight()) // 2
+    win.geometry(f"+{x}+{y}")
+    win.grab_set()
+    root.wait_window(win)
+    return choice['value']
+
+
 def batch_process():
     """批量处理主程序：OCR 识别坐标 -> 在指定 DWG 上绘制红色圆
 
-    图片来源支持两种（可同时使用）：
+    图片来源支持两种：
     1. 一个文件夹内的所有图片
     2. 一个或多个 .docx 文档中嵌入的图片（按出现顺序提取）
+    运行后先弹窗让用户选择来源类型，再进行后续选择。
     """
-    # 1. 弹出文件夹选择窗口（可取消，仅用 docx 时留空）
+    # 1. 弹窗选择图片来源类型
     root = tk.Tk()
     root.withdraw()
     root.attributes('-topmost', True)
-    folder_path = filedialog.askdirectory(title="请选择包含坐标照片的文件夹（可取消，仅用 docx 时跳过）")
 
-    # 2. 选择 .docx 文档（可多选，可取消）
-    docx_paths = filedialog.askopenfilenames(
-        title="请选择包含坐标照片的 .docx 文档（可多选，可取消）",
-        filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")]
-    )
-
-    if not folder_path and not docx_paths:
-        print("未选择任何图片来源（文件夹或 docx），程序退出。")
+    source_type = _ask_source_type(root)
+    if source_type is None:
+        print("未选择图片来源类型，程序退出。")
         return
+
+    folder_path = None
+    docx_paths = ()
+
+    # 2. 根据来源类型弹出对应的选择框
+    if source_type == 'folder':
+        folder_path = filedialog.askdirectory(title="请选择包含坐标照片的文件夹")
+        if not folder_path:
+            print("未选择文件夹，程序退出。")
+            return
+    else:  # docx
+        docx_paths = filedialog.askopenfilenames(
+            title="请选择包含坐标照片的 .docx 文档（可多选）",
+            filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")]
+        )
+        if not docx_paths:
+            print("未选择 docx 文档，程序退出。")
+            return
 
     # 3. 立即选择要绘制的 DWG 文件（在 OCR 开始前选好，无需等待识别完成）
     dwg_path = filedialog.askopenfilename(
