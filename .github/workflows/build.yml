@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:  # 支持手动触发
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -22,3 +25,19 @@ jobs:
           requirements: 'requirements.txt'
           upload_exe_with_name: 'AutoDraw'
           options: --onefile, --name "AutoDraw", --windowed, --collect-all rapidocr, --collect-all onnxruntime, --hidden-import onnxruntime, --hidden-import onnxruntime.capi, --collect-submodules onnxruntime
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built exe
+        uses: actions/download-artifact@v4
+        with:
+          name: AutoDraw
+          path: exe
+
+      - name: Attach exe to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: exe/*.exe
+          generate_release_notes: true
