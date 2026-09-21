@@ -3,6 +3,8 @@ import cv2
 import numpy as np
 import re
 import os
+import sys
+import ctypes
 import shutil
 import tempfile
 from datetime import datetime
@@ -29,6 +31,30 @@ TEXT_WIDTH_FACTOR = 0.8  # 文字宽度因子
 TEXT_COLOR = 3           # AutoCAD 颜色索引：3=绿(acGreen)
 TEXT_STYLE = 'Standard'  # 文字样式
 ZOOM_MARGIN = 5.0        # 绘制完成后视图缩放到绘制区域时的外扩边距（米）
+
+APP_USER_MODEL_ID = 'AutoDraw.AutoCAD.CoordinateTool'  # 任务栏归组与图标标识
+
+
+def _resource_path(rel_name):
+    """获取随程序分发的资源文件绝对路径。
+
+    兼容两种运行方式：源码运行（脚本所在目录）与
+    PyInstaller onefile 打包（sys._MEIPASS 临时解压目录）。
+    """
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel_name)
+
+
+def _apply_window_icon(root):
+    """为 tkinter 窗口设置程序图标，使任务栏/标题栏显示 AutoDraw.ico。
+
+    需打包时通过 --add-data 将 AutoDraw.ico 嵌入；加载失败时静默跳过，
+    不影响正常功能。
+    """
+    try:
+        root.iconbitmap(_resource_path('AutoDraw.ico'))
+    except Exception:
+        pass
 
 
 def _trunc3(x):
@@ -410,6 +436,7 @@ def _ask_source_type(root):
     win.title("选择图片来源")
     win.attributes('-topmost', True)
     win.resizable(False, False)
+    _apply_window_icon(win)
 
     tk.Label(win, text="请选择坐标照片的来源：", font=("Microsoft YaHei", 11),
              padx=30, pady=20).pack()
@@ -450,8 +477,15 @@ def batch_process():
     运行后先弹窗让用户选择来源类型，再进行后续选择。
     """
     # 1. 弹窗选择图片来源类型
+    # 设置任务栏归组标识：否则 windowed 模式打包后任务栏不显示程序图标
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
+
     root = tk.Tk()
     root.withdraw()
+    _apply_window_icon(root)
     root.attributes('-topmost', True)
 
     source_type = _ask_source_type(root)
