@@ -2,9 +2,13 @@ name: Build Windows Executable
 
 on:
   push:
-    tags:
-      - 'v*'
-  workflow_dispatch:  # 支持手动触发
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发版 tag（如 v1.0.4），仅在需创建 Release 时填写；留空则仅打包不发布'
+        required: false
 
 permissions:
   contents: write
@@ -28,8 +32,15 @@ jobs:
 
   release:
     needs: build
+    # 仅在以下情况创建 Release：tag push 或 workflow_dispatch 且手动输入了 tag
+    # 仅 push main 触发时不创建 Release（只验证打包是否成功）
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
     runs-on: ubuntu-latest
+
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download built exe
         uses: actions/download-artifact@v4
         with:
@@ -41,3 +52,6 @@ jobs:
         with:
           files: exe/*.exe
           generate_release_notes: true
+          # tag push 时 GITHUB_REF 自动是 tag；workflow_dispatch 时用 inputs.tag
+          # 二者都有值，action 不会因缺少 tag 报错
+          tag_name: ${{ inputs.tag || github.ref_name }}
