@@ -9,7 +9,7 @@ import shutil
 import tempfile
 from datetime import datetime
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox
 import time
 import win32com.client
 import pythoncom
@@ -34,6 +34,18 @@ ZOOM_MARGIN = 5.0        # 绘制完成后视图缩放到绘制区域时的外�
 
 APP_USER_MODEL_ID = 'AutoDraw.AutoCAD.CoordinateTool'  # 任务栏归组与图标标识
 
+# AutoCAD 颜色索引 (ACI) 到中文名映射，用于窗体下拉框显示
+_ACI_COLORS = [
+    (1, '红'), (2, '黄'), (3, '绿'), (4, '青'),
+    (5, '蓝'), (6, '紫'), (7, '白'), (8, '灰'),
+]
+_ACI_TO_NAME = {i: n for i, n in _ACI_COLORS}
+_NAME_TO_ACI = {n: i for i, n in _ACI_COLORS}
+
+# 主 root 引用（batch_process 创建后存到这里，便于 if __name__ 调用 mainloop
+# 阻塞等用户关闭日志窗）
+_ROOT = None
+
 
 def _resource_path(rel_name):
     """获取随程序分发的资源文件绝对路径。
@@ -55,6 +67,340 @@ def _apply_window_icon(root):
         root.iconbitmap(_resource_path('AutoDraw.ico'))
     except Exception:
         pass
+
+
+class _LogWindowRedirector:
+    """将 print 输出重定向到日志窗体 Text 控件，同时保留原 stdout 输出。
+
+    兼容打包后 --windowed 模式（无控制台）：原 stdout 可能为 None，
+    写入失败时静默跳过，不影响日志窗体显示。
+    """
+
+    def __init__(self, text_widget, original_stdout=None):
+        self.text = text_widget
+        self.original = original_stdout
+        # 关键 emoji 前缀 -> Text tag 名（用于着色）
+        self._tag_rules = (
+            ('✅', 'ok'), ('❌', 'err'), ('⚠️', 'warn'),
+            ('📝', 'info'), ('🔧', 'info'), ('🚀', 'info'),
+            ('📌', 'info'), ('🎯', 'info'), ('📁', 'info'),
+        )
+
+    def write(self, content):
+        # 同步写入 Text 控件 + update_idletasks 立即刷新：
+        # print 在主线程同步调用，OCR 等长任务期间 mainloop 未运行，
+        # after() 调度的任务不会执行，必须同步刷新才能让日志实时显示
+        self._append(content)
+
+    def _append(self, content):
+        if not content:
+            return
+        # 选 tag：按行首 emoji 匹配
+        tag = ''
+        for emoji, tag_name in self._tag_rules:
+            if emoji in content:
+                tag = tag_name
+                break
+        try:
+            if tag:
+                self.text.insert(tk.END, content, (tag,))
+            else:
+                self.text.insert(tk.END, content)
+            self.text.see(tk.END)
+            self.text.update_idletasks()
+        except Exception:
+            # 日志窗已被用户关闭：Text 控件已销毁，仅写原 stdout
+            pass
+        # 同步写原 stdout（IDE 控制台/打包后可能为 None）
+        if self.original is not None:
+            try:
+                self.original.write(content)
+            except Exception:
+                pass
+
+    def flush(self):
+        if self.original is not None:
+            try:
+                self.original.flush()
+            except Exception:
+                pass
+
+
+def _create_main_window():
+    """创建主集成窗体：上半部分文件选择栏 + 下半部分日志输出区。
+
+    窗体布局：
+      顶栏 Frame（固定高度）：
+        - 图片来源：单选按钮（图片文件夹 / Word 文档）+ 路径显示 Entry + 浏览按钮
+        - 目标 DWG：路径显示 Entry + 浏览按钮
+        - 开始处理按钮（路径选齐后启用）
+      底栏 Frame（自动伸展）：
+        - Text + Scrollbar（运行日志，print 输出实时显示）
+
+    返回 (root, state)：root 是主窗口，state 是包含路径变量的字典。
+    程序入口在 if __name__ 中调用 root.mainloop() 阻塞至用户关闭主窗。
+    """
+    root = tk.Tk()
+    root.title("AutoDraw - 自动绘制坐标")
+    root.geometry("900x720")
+    root.minsize(700, 500)
+    _apply_window_icon(root)
+
+    # 主窗关闭 = 程序退出
+    def _on_close():
+        import sys
+        sys.stdout = getattr(_create_main_window, '_orig_stdout', sys.__stdout__)
+        root.quit()
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", _on_close)
+
+    # ---- 顶栏：文件选择 ----
+    top = tk.LabelFrame(root, text="文件选择", font=("Microsoft YaHei", 10),
+                        padx=10, pady=8)
+    top.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(8, 4))
+
+    # 状态变量
+    source_type = tk.StringVar(value='folder')    # 'folder' 或 'docx'
+    folder_path = tk.StringVar(value='')          # 文件夹路径
+    docx_paths_str = tk.StringVar(value='')       # docx 路径列表显示（多选以分号分隔）
+    docx_paths = []                                # 实际路径元组
+    dwg_path = tk.StringVar(value='')             # DWG 路径
+    docx_paths_ref = docx_paths                    # 闭包共享引用
+
+    # 行1：图片来源类型 + 路径 + 浏览
+    row1 = tk.Frame(top)
+    row1.pack(fill=tk.X, pady=(0, 6))
+
+    tk.Label(row1, text="图片来源：", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
+    tk.Radiobutton(row1, text="图片文件夹", variable=source_type, value='folder',
+                   font=("Microsoft YaHei", 10),
+                   command=lambda: _update_browse_state()).pack(side=tk.LEFT, padx=(4, 8))
+    tk.Radiobutton(row1, text="Word 文档(.docx)", variable=source_type, value='docx',
+                   font=("Microsoft YaHei", 10),
+                   command=lambda: _update_browse_state()).pack(side=tk.LEFT, padx=4)
+
+    path_entry = tk.Entry(row1, font=("Microsoft YaHei", 10),
+                          textvariable=folder_path if source_type.get() == 'folder' else docx_paths_str,
+                          state='readonly')
+    path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 4))
+
+    browse_btn = tk.Button(row1, text="浏览...", width=8,
+                           font=("Microsoft YaHei", 10),
+                           command=lambda: _browse_source())
+    browse_btn.pack(side=tk.LEFT)
+
+    # 行2：目标 DWG
+    row2 = tk.Frame(top)
+    row2.pack(fill=tk.X, pady=(0, 8))
+
+    tk.Label(row2, text="目标 DWG：", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
+    tk.Entry(row2, font=("Microsoft YaHei", 10),
+             textvariable=dwg_path, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 4))
+    tk.Button(row2, text="浏览...", width=8,
+              font=("Microsoft YaHei", 10),
+              command=lambda: _browse_dwg()).pack(side=tk.LEFT)
+
+    # 行3：开始处理按钮（居中）
+    row3 = tk.Frame(top)
+    row3.pack(fill=tk.X)
+    start_btn = tk.Button(row3, text="▶  开始处理", font=("Microsoft YaHei", 11, "bold"),
+                          height=1, width=20, command=lambda: _start_processing(),
+                          state=tk.DISABLED)
+    start_btn.pack()
+
+    # ---- 中栏：绘图参数（可选，修改后覆盖默认值，留空或解析失败用默认）----
+    param_frame = tk.LabelFrame(root, text="绘图参数（可选，留空用默认）",
+                                font=("Microsoft YaHei", 10), padx=10, pady=6)
+    param_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
+
+    # 参数定义：(常量名, 标签, 默认值, 类型)；颜色用 'color' 类型走 Combobox 下拉框
+    _param_defs = [
+        ('CIRCLE_RADIUS', '圆半径', str(CIRCLE_RADIUS), float),
+        ('CIRCLE_COLOR', '圆颜色', _ACI_TO_NAME[CIRCLE_COLOR], 'color'),
+        ('LAYER_CIRCLE', '圆图层', LAYER_CIRCLE, str),
+        ('TEXT_HEIGHT', '文字高度', str(TEXT_HEIGHT), float),
+        ('TEXT_WIDTH_FACTOR', '文字宽度', str(TEXT_WIDTH_FACTOR), float),
+        ('TEXT_COLOR', '文字颜色', _ACI_TO_NAME[TEXT_COLOR], 'color'),
+        ('TEXT_STYLE', '文字样式', TEXT_STYLE, str),
+        ('LAYER_TEXT', '文字图层', LAYER_TEXT, str),
+        ('ZOOM_MARGIN', '缩放边距', str(ZOOM_MARGIN), float),
+    ]
+    param_vars = {}    # 常量名 -> StringVar
+    param_types = {}   # 常量名 -> 类型
+    for i, (name, label, default, ptype) in enumerate(_param_defs):
+        row = i // 3
+        col = (i % 3) * 2
+        tk.Label(param_frame, text=label, font=("Microsoft YaHei", 9),
+                 width=8, anchor='e').grid(row=row, column=col, sticky='e', padx=(4, 2), pady=2)
+        var = tk.StringVar(value=default)
+        if ptype == 'color':
+            # 颜色用 Combobox 下拉框显示中文名，readonly 防止用户输入任意值
+            ttk.Combobox(param_frame, textvariable=var,
+                         values=[n for _, n in _ACI_COLORS],
+                         width=12, state='readonly',
+                         font=("Microsoft YaHei", 9)).grid(row=row, column=col + 1, sticky='we', padx=2, pady=2)
+        else:
+            tk.Entry(param_frame, textvariable=var, width=14,
+                     font=("Microsoft YaHei", 9)).grid(row=row, column=col + 1, sticky='we', padx=2, pady=2)
+        param_vars[name] = var
+        param_types[name] = ptype
+    # 列权重让 Entry 随窗口缩放伸展
+    for c in range(6):
+        param_frame.grid_columnconfigure(c, weight=1 if c % 2 else 0)
+
+    # ---- 底栏：日志区 ----
+    bot = tk.LabelFrame(root, text="运行日志", font=("Microsoft YaHei", 10),
+                        padx=8, pady=6)
+    bot.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+
+    scrollbar = tk.Scrollbar(bot)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    log_text = tk.Text(bot, wrap=tk.CHAR, font=("Consolas", 10),
+                       bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4",
+                       yscrollcommand=scrollbar.set)
+    log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.config(command=log_text.yview)
+
+    # 颜色 tag
+    log_text.tag_config('ok', foreground='#4ec9b0')     # 绿
+    log_text.tag_config('err', foreground='#f48771')   # 红
+    log_text.tag_config('warn', foreground='#dcdcaa')  # 黄
+    log_text.tag_config('info', foreground='#569cd6')  # 蓝
+
+    # ---- stdout 重定向到日志 Text ----
+    import sys
+    if not hasattr(_create_main_window, '_orig_stdout'):
+        _create_main_window._orig_stdout = sys.stdout
+    redirector = _LogWindowRedirector(log_text, _create_main_window._orig_stdout)
+    sys.stdout = redirector
+
+    # ---- 回调：更新路径 Entry 关联的 StringVar ----
+    def _update_browse_state():
+        """切换来源类型时切换 path_entry 关联的 StringVar"""
+        if source_type.get() == 'folder':
+            path_entry.config(textvariable=folder_path)
+        else:
+            path_entry.config(textvariable=docx_paths_str)
+        _check_start_ready()
+
+    def _browse_source():
+        """浏览：根据 source_type 弹 folder 或 docx 选择对话框"""
+        if source_type.get() == 'folder':
+            path = filedialog.askdirectory(title="请选择包含坐标照片的文件夹")
+            if path:
+                folder_path.set(path)
+                docx_paths_str.set('')
+                docx_paths_ref.clear()
+        else:
+            paths = filedialog.askopenfilenames(
+                title="请选择包含坐标照片的 .docx 文档（可多选）",
+                filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")]
+            )
+            if paths:
+                docx_paths_ref.clear()
+                docx_paths_ref.extend(paths)
+                # 显示完整路径（多选以分号分隔），便于用户核对
+                docx_paths_str.set("；".join(paths))
+                folder_path.set('')
+        _check_start_ready()
+
+    def _browse_dwg():
+        path = filedialog.askopenfilename(
+            title="请选择要在上面绘制圆的 .dwg 文件",
+            filetypes=[("DWG 文件", "*.dwg"), ("所有文件", "*.*")]
+        )
+        if path:
+            dwg_path.set(path)
+        _check_start_ready()
+
+    def _check_start_ready():
+        """路径齐全才启用开始按钮"""
+        has_source = (source_type.get() == 'folder' and folder_path.get()) \
+                     or (source_type.get() == 'docx' and docx_paths_ref)
+        has_dwg = bool(dwg_path.get())
+        start_btn.config(state=tk.NORMAL if (has_source and has_dwg) else tk.DISABLED)
+
+    def _start_processing():
+        """点击开始：禁用按钮，调 batch_process，结束后重新启用"""
+        folder = folder_path.get() if source_type.get() == 'folder' else None
+        docx = tuple(docx_paths_ref) if source_type.get() == 'docx' else ()
+        dwg = dwg_path.get()
+        # 清空日志区，避免上一次的输出残留（保持 NORMAL 状态：DISABLED 会阻止程序 insert）
+        log_text.delete('1.0', tk.END)
+        # 应用绘图参数：读取 Entry 值，按类型转换更新模块级常量
+        # 解析失败或留空时保留原默认值，仅打印警告
+        _apply_params()
+        # 禁用所有控件，防止处理过程中误操作
+        start_btn.config(state=tk.DISABLED, text="处理中...")
+        browse_btn.config(state=tk.DISABLED)
+        for child in top.winfo_children():
+            try:
+                child.config(state=tk.DISABLED)
+            except tk.TclError:
+                pass
+        for child in param_frame.winfo_children():
+            try:
+                child.config(state=tk.DISABLED)
+            except tk.TclError:
+                pass
+        root.update_idletasks()
+        try:
+            batch_process(folder, docx, dwg, root)
+        except Exception as e:
+            print(f"\n💥 程序异常终止: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # 恢复按钮，允许用户重新选择并再次处理
+            start_btn.config(state=tk.NORMAL, text="▶  开始处理")
+            browse_btn.config(state=tk.NORMAL)
+            for child in top.winfo_children():
+                try:
+                    child.config(state=tk.NORMAL)
+                except tk.TclError:
+                    pass
+            for child in param_frame.winfo_children():
+                try:
+                    child.config(state=tk.NORMAL)
+                except tk.TclError:
+                    pass
+            _check_start_ready()
+            print("\n提示：可重新选择路径并继续处理下一批，或关闭窗口退出程序。")
+
+    def _apply_params():
+        """读取参数 Entry/Combobox，按声明类型转换并更新模块级常量。
+        留空或解析失败时保留原默认值，仅打印警告。"""
+        module_globals = globals()
+        for name, var in param_vars.items():
+            raw = var.get().strip()
+            if not raw:
+                continue
+            ptype = param_types[name]
+            try:
+                if ptype == 'color':
+                    # 颜色：从中文名查 ACI 索引
+                    new_val = _NAME_TO_ACI.get(raw)
+                    if new_val is None:
+                        raise ValueError(f"未知颜色名: {raw}")
+                elif ptype is str:
+                    new_val = raw
+                else:
+                    new_val = ptype(raw)
+                old = module_globals.get(name)
+                if new_val != old:
+                    module_globals[name] = new_val
+                    # 颜色项额外显示 ACI 与颜色名，便于核对
+                    display = f"{new_val}({_ACI_TO_NAME.get(new_val, '?')})" if ptype == 'color' else new_val
+                    print(f"⚙️ 参数已更新: {name} = {display}（默认 {old}）")
+            except (ValueError, TypeError):
+                old = module_globals.get(name)
+                print(f"⚠️ 参数 {name}='{raw}' 解析失败（类型 {ptype}），保留默认 {old}")
+
+    _update_browse_state()
+    root.update()
+    return root, {'folder_path': folder_path, 'docx_paths': docx_paths_ref,
+                 'dwg_path': dwg_path, 'source_type': source_type}
 
 
 def _trunc3(x):
@@ -243,6 +589,31 @@ def _ensure_layer(doc, layer_name):
         return doc.Layers.Add(layer_name)
 
 
+def _is_com_call_rejected(exc):
+    """判断异常是否为可重试的瞬态 COM 错误。
+
+    AutoCAD 处于忙状态（重绘、用户操作或对话框处理）时会拒绝 COM 调用，
+    短暂等待后重试通常即可成功。win32com 还可能偶发地把属性解析为方法，
+    抛 "Property 'X' can not be set" —— 同样可通过 retry 恢复。
+    """
+    hr = None
+    if hasattr(exc, 'hresult'):
+        hr = exc.hresult
+    elif getattr(exc, 'args', None):
+        try:
+            hr = int(exc.args[0])
+        except (TypeError, ValueError):
+            pass
+    # RPC_E_CALL_REJECTED (0x80010001)
+    if hr == -2147418111:
+        return True
+    # 偶发 win32com 属性解析错误（"Property 'X' can not be set"）
+    msg = str(exc)
+    if "can not be set" in msg:
+        return True
+    return False
+
+
 def _draw_on_doc(doc, points):
     """在给定文档上绘制圆与高程文字标注。
 
@@ -257,40 +628,56 @@ def _draw_on_doc(doc, points):
     drawn = 0
     failed = []
     for easting, northing, elevation, suffix, source_file in points:
-        circle = None
-        try:
-            # ---- 红色圆（图层：长崖边巷道）----
-            center = win32com.client.VARIANT(
-                pythoncom.VT_ARRAY | pythoncom.VT_R8,
-                (float(easting), float(northing), POINT_Z)
-            )
-            circle = model_space.AddCircle(center, CIRCLE_RADIUS)
-            circle.Layer = LAYER_CIRCLE
-            circle.color = CIRCLE_COLOR   # 红色
-            circle.Update()
+        # AutoCAD 处于忙状态时会拒绝 COM 调用 (RPC_E_CALL_REJECTED)，
+        # 单个点的绘制流程作为 retry 单元：失败时清理半成品圆后短暂等待重试，
+        # 最多 3 次。非 RPC 拒绝错误直接记录失败不重试。
+        last_err = None
+        for attempt in range(3):
+            circle = None
+            try:
+                # ---- 红色圆（图层：长崖边巷道）----
+                center = win32com.client.VARIANT(
+                    pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                    (float(easting), float(northing), POINT_Z)
+                )
+                circle = model_space.AddCircle(center, CIRCLE_RADIUS)
+                circle.Layer = LAYER_CIRCLE
+                circle.color = CIRCLE_COLOR   # 红色
+                circle.Update()
 
-            # ---- 高程文字（图层：长崖边巷道高程文字标注，绿色，与圆重叠居中）----
-            # 高程截断 3 位后拼接后缀（如 "1157.225中顶"）
-            text_content = _trunc3(elevation) + suffix
-            text_obj = model_space.AddText(text_content, center, TEXT_HEIGHT)
-            text_obj.Layer = LAYER_TEXT
-            text_obj.color = TEXT_COLOR      # 绿色
-            text_obj.StyleName = TEXT_STYLE
-            text_obj.ScaleFactor = TEXT_WIDTH_FACTOR
-            text_obj.HorizontalAlignment = 4  # acHorizontalAlignmentMiddle：以对齐点为文字中心
-            text_obj.TextAlignmentPoint = center
-            text_obj.Update()
+                # ---- 高程文字（图层：长崖边巷道高程文字标注，绿色，与圆重叠居中）----
+                # 高程截断 3 位后拼接后缀（如 "1157.225中顶"）
+                text_content = _trunc3(elevation) + suffix
+                text_obj = model_space.AddText(text_content, center, TEXT_HEIGHT)
+                text_obj.Layer = LAYER_TEXT
+                text_obj.color = TEXT_COLOR      # 绿色
+                text_obj.StyleName = TEXT_STYLE
+                text_obj.ScaleFactor = TEXT_WIDTH_FACTOR
+                text_obj.HorizontalAlignment = 4  # acHorizontalAlignmentMiddle：以对齐点为文字中心
+                text_obj.TextAlignmentPoint = center
+                text_obj.Update()
 
-            drawn += 1
-            print(f"   ✅ 已绘制圆+高程标注: X(东)={easting}  Y(北)={northing}  高程={text_content}  <- {source_file}")
-        except Exception as e:
-            # 圆已画出但后续失败：删除半成品圆，避免图上留下没有标注的圆
-            if circle is not None:
-                try:
-                    circle.Delete()
-                except Exception:
-                    pass
-            reason = str(e).replace('\n', ' ')[:200]
+                drawn += 1
+                print(f"   ✅ 已绘制圆+高程标注: X(东)={easting}  Y(北)={northing}  高程={text_content}  <- {source_file}")
+                last_err = None
+                break  # 成功，跳出 retry 循环
+            except Exception as e:
+                # 圆已画出但后续失败：删除半成品圆，避免图上留下没有标注的圆
+                if circle is not None:
+                    try:
+                        circle.Delete()
+                    except Exception:
+                        pass
+                last_err = e
+                if _is_com_call_rejected(e) and attempt < 2:
+                    # RPC 调用被拒绝：短暂等待让 AutoCAD 处理完手头工作再 retry
+                    time.sleep(0.5)
+                    continue
+                # 非重试型错误（或已用尽重试次数）：直接记录失败
+                break
+
+        if last_err is not None:
+            reason = str(last_err).replace('\n', ' ')[:200]
             failed.append((source_file, f"绘制失败: {reason}"))
             print(f"   ❌ 绘制失败: {source_file} -> {reason}")
 
@@ -357,7 +744,19 @@ def draw_circles_on_dwg(dwg_path, points):
             pythoncom.VT_ARRAY | pythoncom.VT_R8,
             (max(xs) + margin, max(ys) + margin, POINT_Z)
         )
-        acad.ZoomWindow(lower, upper)
+        # ZoomWindow 同样可能被 AutoCAD 拒绝（RPC_E_CALL_REJECTED），加 retry；
+        # 失败时仅打印警告不抛出异常——前面已成功绘制的圆和文字标注不受影响
+        for attempt in range(3):
+            try:
+                acad.ZoomWindow(lower, upper)
+                break
+            except Exception as e:
+                if _is_com_call_rejected(e) and attempt < 2:
+                    time.sleep(0.5)
+                    continue
+                # 重试用尽或非重试错误：缩放失败不影响已绘制内容
+                print(f"   ⚠️ 视图缩放失败（已绘制内容不受影响）: {e}")
+                break
     return drawn, failed
 
 
@@ -484,30 +883,95 @@ def extract_images_from_docx(docx_path, output_dir):
         # python-docx 打开成功但没找到图片，可能是浮动图片或空文档，
         # 不立即返回，继续尝试回退策略以防遗漏
     except Exception as e:
-        print(f"   ℹ️ python-docx 解析失败，尝试直接解压提取：{str(e)[:80]}")
+        # WPS 生成的非标准 docx 缺 docProps/core.xml，python-docx 打开必失败；
+        # 此为已知情况，静默走 zipfile 回退策略，不打印噪音
+        if 'docProps/core.xml' not in str(e):
+            print(f"   ℹ️ python-docx 解析失败，尝试直接解压提取：{str(e)[:80]}")
 
-    # ---- 策略2：zipfile 直接解压 word/media/（兼容性优先，无法解析备注）----
+    # ---- 策略2：zipfile 直接解析 document.xml（不依赖 python-docx，仍可解析备注）----
     import zipfile
     import re as _re
+    import xml.etree.ElementTree as ET
     extracted = []
+    # OOXML 命名空间
+    _W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    _A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    _R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+    def _qn(ns, tag):
+        return f"{{{ns}}}{tag}"
+
     try:
         with zipfile.ZipFile(docx_path, 'r') as z:
-            media_names = [n for n in z.namelist()
-                           if n.startswith('word/media/') and not n.endswith('/')]
-            # 按文件名中的数字序号排序，尽量还原插入顺序
-            def _sort_key(name):
-                m = _re.search(r'(\d+)', os.path.basename(name))
-                return (int(m.group(1)) if m else 9999, name)
-            media_names.sort(key=_sort_key)
+            # 读 rels：rId -> media 路径
+            # 注意：WPS 生成的 docx 可能将同一 rId 定义多次（如 rId6 既是 image 又是 numbering），
+            # 只记录 Type 以 /image 结尾的关系，且遇到同 rId 已有 image 记录时不覆盖
+            rels_map = {}
+            try:
+                with z.open('word/_rels/document.xml.rels') as rf:
+                    rels_root = ET.fromstring(rf.read())
+                for rel in rels_root.iter():
+                    rid = rel.get('Id')
+                    target = rel.get('Target')
+                    rtype = rel.get('Type', '')
+                    if not (rid and target):
+                        continue
+                    # 只接受图片类型关系，非图片类型不记录
+                    if not rtype.endswith('/image'):
+                        continue
+                    # 已有图片记录则不覆盖（保留第一次定义）
+                    if rid not in rels_map:
+                        rels_map[rid] = target  # 如 "media/image1.png"
+            except Exception:
+                pass
+
+            # 读 document.xml，按段落顺序提取文字与图片
+            with z.open('word/document.xml') as df:
+                doc_root = ET.fromstring(df.read())
+            body = doc_root.find(_qn(_W_NS, 'body'))
+            if body is None:
+                raise RuntimeError("document.xml 缺少 body 元素")
 
             idx = 0
-            for name in media_names:
-                ext = os.path.splitext(name)[1].lower()
-                if ext not in zip_ext_map:
+            pending_notes = []
+            for child in list(body):
+                tag = child.tag.split('}')[-1]
+                if tag != 'p':
+                    # 非段落（如表格）：跳过，表格内图片暂不处理
                     continue
-                idx += 1
-                blob = z.read(name)
-                extracted.append(_save_image(blob, zip_ext_map[ext], idx, ''))
+                # 段落文字
+                texts = [t.text or '' for t in child.iter(_qn(_W_NS, 't'))]
+                para_text = ''.join(texts).strip()
+                # 段落内图片
+                blips = list(child.iter(_qn(_A_NS, 'blip')))
+
+                if blips:
+                    note_for_first = '\n'.join(pending_notes)
+                    pending_notes.clear()
+                    for bi, blip in enumerate(blips):
+                        rid = blip.get(_qn(_R_NS, 'embed'))
+                        if not rid:
+                            continue
+                        media_rel = rels_map.get(rid)
+                        if not media_rel:
+                            continue
+                        # rels 里 Target 是相对路径，如 "media/image1.png"，补 word/ 前缀
+                        zip_path = 'word/' + media_rel if not media_rel.startswith('word/') else media_rel
+                        ext = os.path.splitext(zip_path)[1].lower()
+                        # 过滤非图片关系（numbering.xml/styles.xml 等）
+                        if ext not in zip_ext_map:
+                            continue
+                        try:
+                            blob = z.read(zip_path)
+                        except Exception:
+                            continue
+                        content_type = zip_ext_map[ext]
+                        idx += 1
+                        note = note_for_first if bi == 0 else ''
+                        extracted.append(_save_image(blob, content_type, idx, note))
+                elif para_text:
+                    pending_notes.append(para_text)
+
     except Exception as e:
         raise RuntimeError(f"无法从文档提取图片：{e}")
 
@@ -516,101 +980,27 @@ def extract_images_from_docx(docx_path, output_dir):
     return extracted
 
 
-def _ask_source_type(root):
-    """弹窗让用户选择图片来源类型，返回 'folder' 或 'docx'，取消返回 None。"""
-    choice = {'value': None}
-    win = tk.Toplevel(root)
-    win.title("选择图片来源")
-    win.attributes('-topmost', True)
-    win.resizable(False, False)
-    _apply_window_icon(win)
-
-    tk.Label(win, text="请选择坐标照片的来源：", font=("Microsoft YaHei", 11),
-             padx=30, pady=20).pack()
-
-    btn_frame = tk.Frame(win)
-    btn_frame.pack(pady=(0, 20))
-
-    def pick_folder():
-        choice['value'] = 'folder'
-        win.destroy()
-
-    def pick_docx():
-        choice['value'] = 'docx'
-        win.destroy()
-
-    tk.Button(btn_frame, text="📁 图片文件夹", font=("Microsoft YaHei", 11),
-              width=16, height=2, command=pick_folder).pack(side=tk.LEFT, padx=10)
-    tk.Button(btn_frame, text="📄 Word 文档(.docx)", font=("Microsoft YaHei", 11),
-              width=16, height=2, command=pick_docx).pack(side=tk.LEFT, padx=10)
-
-    win.protocol("WM_DELETE_WINDOW", win.destroy)
-    win.update_idletasks()
-    # 居中
-    x = (win.winfo_screenwidth() - win.winfo_reqwidth()) // 2
-    y = (win.winfo_screenheight() - win.winfo_reqheight()) // 2
-    win.geometry(f"+{x}+{y}")
-    win.grab_set()
-    root.wait_window(win)
-    return choice['value']
-
-
-def batch_process():
+def batch_process(folder_path, docx_paths, dwg_path, root):
     """批量处理主程序：OCR 识别坐标 -> 在指定 DWG 上绘制红色圆
 
     图片来源支持两种：
     1. 一个文件夹内的所有图片
     2. 一个或多个 .docx 文档中嵌入的图片（按出现顺序提取）
-    运行后先弹窗让用户选择来源类型，再进行后续选择。
+
+    参数由主窗（_create_main_window）传入：
+    folder_path: 图片文件夹路径或 None
+    docx_paths: .docx 路径元组（可为空）
+    dwg_path: 目标 DWG 文件路径
+    root: 主窗口引用（用作 messagebox.parent）
     """
-    # 1. 弹窗选择图片来源类型
-    # 设置任务栏归组标识：否则 windowed 模式打包后任务栏不显示程序图标
-    try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
-    except Exception:
-        pass
-
-    root = tk.Tk()
-    root.withdraw()
-    _apply_window_icon(root)
-    root.attributes('-topmost', True)
-
-    source_type = _ask_source_type(root)
-    if source_type is None:
-        print("未选择图片来源类型，程序退出。")
-        return
-
-    folder_path = None
-    docx_paths = ()
-
-    # 2. 根据来源类型弹出对应的选择框
-    if source_type == 'folder':
-        folder_path = filedialog.askdirectory(title="请选择包含坐标照片的文件夹")
-        if not folder_path:
-            print("未选择文件夹，程序退出。")
-            return
-    else:  # docx
-        docx_paths = filedialog.askopenfilenames(
-            title="请选择包含坐标照片的 .docx 文档（可多选）",
-            filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")]
-        )
-        if not docx_paths:
-            print("未选择 docx 文档，程序退出。")
-            return
-
-    # 3. 立即选择要绘制的 DWG 文件（在 OCR 开始前选好，无需等待识别完成）
-    dwg_path = filedialog.askopenfilename(
-        title="请选择要在上面绘制圆的 .dwg 文件",
-        filetypes=[("DWG 文件", "*.dwg"), ("所有文件", "*.*")]
-    )
-    if not dwg_path:
-        print("未选择 DWG 文件，程序退出。")
-        return
+    print(f"AutoDraw 启动")
+    print(f"图片来源: {'文件夹' if folder_path else 'Word文档'} | DWG: {os.path.basename(dwg_path)}")
+    print("=" * 50)
 
     print("⏳ 正在加载 OCR 模型（首次运行会自动下载，请稍候）...")
     _get_ocr_engine()
 
-    # 4. 收集所有待处理图片：[(完整路径, 显示文件名), ...]
+    # 4. 收集所有待处理图片：[(完整路径, 显示文件名, 备注字符串), ...]
     #    先收集文件夹内图片，再提取 docx 内图片
     supported_formats = ('.png', '.jpg', '.jpeg', '.bmp')
     image_list = []   # [(完整路径, 显示文件名, 备注字符串), ...]
@@ -652,9 +1042,6 @@ def batch_process():
         print(f"   北坐标: {result['北坐标']}")
         print(f"   东坐标: {result['东坐标']}")
         print(f"   高  程: {result['高程']}")
-        if note:
-            print(f"   📝 备注: {note}")
-        print("-" * 50)
 
         # 6. 收集识别成功的有效坐标（东坐标=X，北坐标=Y，高程用于文字标注）
         try:
@@ -663,20 +1050,27 @@ def batch_process():
             elevation = float(result["高程"])
 
             # 应用 docx 备注：解析 offset 与 suffix，修正高程 + 追加后缀
+            # 备注与应用备注应紧邻显示（同一点的操作），最后才打印分隔线
             offset, suffix = 0.0, ''
             if note:
                 parsed = _parse_elevation_note(note)
                 if parsed:
                     offset, suffix = parsed
                     elevation_new = elevation + offset
-                    print(f"   🔧 应用备注: 高程 {_trunc3(elevation)} + ({_trunc3(offset)}) = {_trunc3(elevation_new)}, 标注: {_trunc3(elevation_new)}{suffix}")
+                    print(f"   � 备注: {note}")
+                    print(f"   �� 应用备注: 高程 {_trunc3(elevation)} + ({_trunc3(offset)}) = {_trunc3(elevation_new)}, 标注: {_trunc3(elevation_new)}{suffix}")
                     elevation = elevation_new
+                else:
+                    # 不可解析的备注（如纯"中顶"），仅显示备注本身
+                    print(f"   📝 备注: {note}")
             valid_points.append((easting, northing, elevation, suffix, filename))
         except (ValueError, TypeError):
             # 识别失败或报错：记录原因，稍后统一归档
             east = str(result.get("东坐标", ""))
             reason = ("OCR识别异常: " + east) if east.startswith("报错") else "坐标识别失败（未提取到3个有效坐标值）"
             failures.append((full_path, filename, reason))
+        # 分隔线统一在每张图片处理结束后打印（含备注应用情况）
+        print("-" * 50)
 
     # 归档基础目录：有文件夹用文件夹；仅 docx 时用第一个 docx 所在目录，
     # 避免归档目录建在 temp_dir 内被清理时误删。
@@ -714,14 +1108,14 @@ def batch_process():
         print("请确认本机已安装 AutoCAD，且 DWG 文件未被其他程序独占占用。")
         # CAD 整体不可用：所有待绘图片都按绘制失败归档
         draw_failed = [
-            (pt[3], f"AutoCAD连接/打开图纸失败: {cad_fatal[:150]}")
+            (pt[4], f"AutoCAD连接/打开图纸失败: {cad_fatal[:150]}")
             for pt in valid_points
         ]
 
     # 合并 OCR 失败与绘制失败的图片（按文件名去重）
     existing = {name for _, name, _ in failures}
     # 建立 文件名 -> 完整路径 的映射（含文件夹图片和 docx 临时图片）
-    name_to_path = {fn: fp for fp, fn in image_list}
+    name_to_path = {fn: fp for fp, fn, _ in image_list}
     for failed_name, reason in draw_failed:
         if failed_name not in existing:
             failures.append((name_to_path.get(failed_name, failed_name), failed_name, reason))
@@ -756,4 +1150,12 @@ def batch_process():
 
 
 if __name__ == "__main__":
-    batch_process()
+    # 设置任务栏归组标识：否则 windowed 模式打包后任务栏不显示程序图标
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
+    # 创建主集成窗体：上半部分文件选择 + 下半部分日志输出
+    # 主窗关闭即程序退出，mainloop 阻塞至用户关闭窗口
+    _ROOT, _ = _create_main_window()
+    _ROOT.mainloop()
