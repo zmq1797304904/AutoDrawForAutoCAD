@@ -130,6 +130,75 @@ def _coords_from_text(text):
     return [n for n in all_numbers if abs(float(n)) > 100]
 
 
+# 备注解析：位置后缀关键词
+_POSITION_KEYWORDS = ('中顶', '右顶', '左顶')
+
+
+def _parse_elevation_note(text):
+    """解析 docx 段落文字备注，返回 (offset, suffix) 或 None。
+
+    支持三种形式（同段可多次出现并累积）：
+      - 纯数值："-0.1"、"+1.3"、"-1"   → 高程增减
+      - 纯位置："中顶"、"右顶"、"左顶" → 文字标注追加后缀
+      - 组合：  "+0.6中顶"、"-0.2右顶" → 数值修正 + 后缀追加
+
+    过滤策略：|offset| > 5 视为非备注（如段落编号、日期等）。
+    后缀去重：同段重复"中顶中顶"只保留一个。
+    """
+    if not text:
+        return None
+
+    offset = 0.0
+    suffix_parts = []
+
+    # 1. 组合形式（数值+位置）：优先匹配，避免被纯数值规则吞掉后缀
+    combo_pat = re.compile(r'([+-]?\d+\.?\d*)\s*(中顶|右顶|左顶)')
+    consumed_spans = []  # 已被组合规则消费的字符区间，避免纯数值规则二次匹配
+    for m in combo_pat.finditer(text):
+        try:
+            v = float(m.group(1))
+        except ValueError:
+            continue
+        if abs(v) > 5:
+            continue
+        offset += v
+        if m.group(2) not in suffix_parts:
+            suffix_parts.append(m.group(2))
+        consumed_spans.append((m.start(), m.end()))
+
+    # 2. 纯位置关键词（未被组合规则覆盖的）
+    pos_pat = re.compile(r'(中顶|右顶|左顶)')
+    consumed_pos_spans = []
+    for m in pos_pat.finditer(text):
+        # 落在已消费区间内则跳过
+        if any(s <= m.start() and m.end() <= e for s, e in consumed_spans):
+            continue
+        if m.group(1) not in suffix_parts:
+            suffix_parts.append(m.group(1))
+        consumed_pos_spans.append((m.start(), m.end()))
+
+    # 3. 纯数值（未被组合规则覆盖的）：|v|<=5 才接受
+    num_pat = re.compile(r'([+-]?\d+\.?\d*)')
+    for m in num_pat.finditer(text):
+        if any(s <= m.start() and m.end() <= e for s, e in consumed_spans):
+            continue
+        try:
+            v = float(m.group(1))
+        except ValueError:
+            continue
+        if abs(v) > 5:
+            continue
+        # 过滤明显非备注：整数部分 > 2 位（如段落编号"2024"、日期"20240301"）
+        int_part = m.group(1).lstrip('+-').split('.')[0]
+        if len(int_part) > 2:
+            continue
+        offset += v
+
+    if offset == 0.0 and not suffix_parts:
+        return None
+    return (offset, ''.join(suffix_parts))
+
+
 def extract_coords(image_path):
     """从单张图片中提取坐标。
 
@@ -177,7 +246,7 @@ def _ensure_layer(doc, layer_name):
 def _draw_on_doc(doc, points):
     """在给定文档上绘制圆与高程文字标注。
 
-    points: [(东坐标X, 北坐标Y, 高程, 文件名), ...]
+    points: [(东坐标X, 北坐标Y, 高程, 后缀, 文件名), ...]
     返回 (成功数量, 失败列表[(文件名, 失败原因)])。
     单个点绘制失败不影响其他点；若圆已画出但文字失败，会删除该圆保持整组回滚。
     """
@@ -187,7 +256,7 @@ def _draw_on_doc(doc, points):
     model_space = doc.ModelSpace
     drawn = 0
     failed = []
-    for easting, northing, elevation, source_file in points:
+    for easting, northing, elevation, suffix, source_file in points:
         circle = None
         try:
             # ---- 红色圆（图层：长崖边巷道）----
@@ -201,7 +270,9 @@ def _draw_on_doc(doc, points):
             circle.Update()
 
             # ---- 高程文字（图层：长崖边巷道高程文字标注，绿色，与圆重叠居中）----
-            text_obj = model_space.AddText(_trunc3(elevation), center, TEXT_HEIGHT)
+            # 高程截断 3 位后拼接后缀（如 "1157.225中顶"）
+            text_content = _trunc3(elevation) + suffix
+            text_obj = model_space.AddText(text_content, center, TEXT_HEIGHT)
             text_obj.Layer = LAYER_TEXT
             text_obj.color = TEXT_COLOR      # 绿色
             text_obj.StyleName = TEXT_STYLE
@@ -211,7 +282,7 @@ def _draw_on_doc(doc, points):
             text_obj.Update()
 
             drawn += 1
-            print(f"   ✅ 已绘制圆+高程标注: X(东)={easting}  Y(北)={northing}  高程={elevation}  <- {source_file}")
+            print(f"   ✅ 已绘制圆+高程标注: X(东)={easting}  Y(北)={northing}  高程={text_content}  <- {source_file}")
         except Exception as e:
             # 圆已画出但后续失败：删除半成品圆，避免图上留下没有标注的圆
             if circle is not None:
@@ -330,19 +401,20 @@ def archive_failed_images(folder_path, failures):
 
 
 def extract_images_from_docx(docx_path, output_dir):
-    """从 docx 文档中按出现顺序提取所有嵌入式图片到 output_dir。
+    """从 docx 文档中按出现顺序提取所有嵌入式图片到 output_dir，并解析每张图片上方紧挨的文字备注。
 
-    返回 [(保存后的完整路径, 显示用文件名), ...]。
+    返回 [(保存后的完整路径, 显示用文件名, 备注字符串), ...]。
+    备注字符串为该图上方连续文字段落的合并文本（可能为 ""）。
     文件名格式：{文档名(去扩展名)}_{序号:03d}.{扩展名}，便于追溯来源。
 
     解析策略：
-    1. 优先用 python-docx 解析（能保证图片在文档中的出现顺序）；
+    1. 优先用 python-docx 遍历段落（保留图片与文字的相对顺序，能解析备注）；
     2. 若文档结构不标准（如 WPS 生成的 docx 缺少 docProps/core.xml 导致
-       python-docx 无法打开），则回退到直接用 zipfile 解压 word/media/
-       目录，按文件名序号排序提取。
+       python-docx 无法打开），则回退到直接用 zipfile 解压 word/media/，
+       按文件名序号排序提取；此时无法解析备注，note 全部为 ""。
     """
     from docx import Document
-    from docx.enum.shape import WD_INLINE_SHAPE
+    from docx.oxml.ns import qn
 
     doc_base = os.path.splitext(os.path.basename(docx_path))[0]
 
@@ -364,34 +436,49 @@ def extract_images_from_docx(docx_path, output_dir):
         '.emf': 'image/x-emf', '.wmf': 'image/x-wmf',
     }
 
-    def _save_image(blob, content_type, idx):
+    def _save_image(blob, content_type, idx, note):
         ext = ext_map.get(content_type, '.png')
         filename = f"{doc_base}_{idx:03d}{ext}"
         save_path = os.path.join(output_dir, filename)
         with open(save_path, 'wb') as f:
             f.write(blob)
-        return (save_path, filename)
+        return (save_path, filename, note)
 
-    # ---- 策略1：python-docx（顺序可靠）----
+    # ---- 策略1：python-docx 遍历段落（保留顺序、解析备注）----
     try:
         doc = Document(docx_path)
         extracted = []
         idx = 0
-        for shape in doc.inline_shapes:
-            # 只处理图片类型（忽略公式、图表等）
-            if shape.type != WD_INLINE_SHAPE.PICTURE:
-                continue
-            try:
-                image_part = shape._inline.graphic.graphicData.pic.blipFill.blip
-                rId = image_part.embed
-                image_part = doc.part.related_parts[rId]
-            except Exception:
-                try:
-                    image_part = shape.image_part
-                except Exception:
-                    continue
-            idx += 1
-            extracted.append(_save_image(image_part.blob, image_part.content_type, idx))
+        # 待挂载备注缓冲区：遇到图片时把缓冲区内容作为该图片的 note，然后清空
+        pending_notes = []
+
+        for para in doc.paragraphs:
+            # 提取段落内所有图片（inline + anchor 都用 <a:blip r:embed="rIdX">）
+            blips = para._p.findall('.//' + qn('a:blip'))
+            para_text = para.text.strip()
+
+            if blips:
+                # 段落含图片：把已累积的备注挂到本段第一张图上，
+                # 同段多张图按顺序继承（同段多图共用同一组备注）
+                note_for_first = '\n'.join(pending_notes)
+                pending_notes.clear()
+                for bi, blip in enumerate(blips):
+                    rId = blip.get(qn('r:embed'))
+                    if not rId:
+                        continue
+                    try:
+                        part = doc.part.related_parts[rId]
+                    except Exception:
+                        continue
+                    idx += 1
+                    # 同段第二张及之后的图不重复挂载备注（避免一份备注被多张图误用）
+                    note = note_for_first if bi == 0 else ''
+                    extracted.append(_save_image(part.blob, part.content_type, idx, note))
+                # 段内若同时有文字，文字视为对该段图片的说明，不当作下一张图的备注
+            elif para_text:
+                # 纯文字段落：作为备注候选加入缓冲区
+                pending_notes.append(para_text)
+
         if extracted:
             return extracted
         # python-docx 打开成功但没找到图片，可能是浮动图片或空文档，
@@ -399,7 +486,7 @@ def extract_images_from_docx(docx_path, output_dir):
     except Exception as e:
         print(f"   ℹ️ python-docx 解析失败，尝试直接解压提取：{str(e)[:80]}")
 
-    # ---- 策略2：zipfile 直接解压 word/media/（兼容性优先）----
+    # ---- 策略2：zipfile 直接解压 word/media/（兼容性优先，无法解析备注）----
     import zipfile
     import re as _re
     extracted = []
@@ -420,7 +507,7 @@ def extract_images_from_docx(docx_path, output_dir):
                     continue
                 idx += 1
                 blob = z.read(name)
-                extracted.append(_save_image(blob, zip_ext_map[ext], idx))
+                extracted.append(_save_image(blob, zip_ext_map[ext], idx, ''))
     except Exception as e:
         raise RuntimeError(f"无法从文档提取图片：{e}")
 
@@ -526,13 +613,13 @@ def batch_process():
     # 4. 收集所有待处理图片：[(完整路径, 显示文件名), ...]
     #    先收集文件夹内图片，再提取 docx 内图片
     supported_formats = ('.png', '.jpg', '.jpeg', '.bmp')
-    image_list = []   # [(完整路径, 显示文件名), ...]
+    image_list = []   # [(完整路径, 显示文件名, 备注字符串), ...]
     temp_dir = None   # docx 提取图片的临时目录，结束时清理
 
     if folder_path:
         for filename in sorted(os.listdir(folder_path)):
             if filename.lower().endswith(supported_formats):
-                image_list.append((os.path.join(folder_path, filename), filename))
+                image_list.append((os.path.join(folder_path, filename), filename, ''))
         print(f"\n📁 文件夹图片：{len(image_list)} 张")
 
     if docx_paths:
@@ -541,7 +628,8 @@ def batch_process():
             try:
                 imgs = extract_images_from_docx(docx_path, temp_dir)
                 image_list.extend(imgs)
-                print(f"📄 {os.path.basename(docx_path)}：提取到 {len(imgs)} 张图片")
+                notes_count = sum(1 for _, _, n in imgs if n)
+                print(f"📄 {os.path.basename(docx_path)}：提取到 {len(imgs)} 张图片（其中 {notes_count} 张含备注）")
             except Exception as e:
                 print(f"⚠️ 读取 docx 失败 {os.path.basename(docx_path)}: {e}")
 
@@ -553,10 +641,10 @@ def batch_process():
 
     print(f"\n🚀 共收集 {len(image_list)} 张图片，开始识别...\n{'=' * 50}")
 
-    valid_points = []   # [(东坐标, 北坐标, 高程, 文件名), ...]
+    valid_points = []   # [(东坐标, 北坐标, 高程, 后缀, 文件名), ...]
     failures = []       # [(图片完整路径, 文件名, 失败原因), ...]
     total_images = len(image_list)
-    for full_path, filename in image_list:
+    for full_path, filename, note in image_list:
         result = extract_coords(full_path)
 
         # 5. 打印识别结果
@@ -564,6 +652,8 @@ def batch_process():
         print(f"   北坐标: {result['北坐标']}")
         print(f"   东坐标: {result['东坐标']}")
         print(f"   高  程: {result['高程']}")
+        if note:
+            print(f"   📝 备注: {note}")
         print("-" * 50)
 
         # 6. 收集识别成功的有效坐标（东坐标=X，北坐标=Y，高程用于文字标注）
@@ -571,7 +661,17 @@ def batch_process():
             easting = float(result["东坐标"])
             northing = float(result["北坐标"])
             elevation = float(result["高程"])
-            valid_points.append((easting, northing, elevation, filename))
+
+            # 应用 docx 备注：解析 offset 与 suffix，修正高程 + 追加后缀
+            offset, suffix = 0.0, ''
+            if note:
+                parsed = _parse_elevation_note(note)
+                if parsed:
+                    offset, suffix = parsed
+                    elevation_new = elevation + offset
+                    print(f"   🔧 应用备注: 高程 {_trunc3(elevation)} + ({_trunc3(offset)}) = {_trunc3(elevation_new)}, 标注: {_trunc3(elevation_new)}{suffix}")
+                    elevation = elevation_new
+            valid_points.append((easting, northing, elevation, suffix, filename))
         except (ValueError, TypeError):
             # 识别失败或报错：记录原因，稍后统一归档
             east = str(result.get("东坐标", ""))
