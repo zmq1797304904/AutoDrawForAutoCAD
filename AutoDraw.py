@@ -692,39 +692,58 @@ def draw_circles_on_dwg(dwg_path, points):
     """
     abs_dwg = os.path.abspath(dwg_path)
 
-    # 连接（或启动）AutoCAD
-    acad = win32com.client.Dispatch("AutoCAD.Application")
-    acad.Visible = True
-
-    # 若该图纸已在 AutoCAD 中打开则直接激活，否则重新打开
-    doc = None
-    for open_doc in acad.Documents:
+    # 连接/打开图纸阶段也可能因 AutoCAD 忙被拒（RPC_E_CALL_REJECTED），
+    # 整体包在 retry 循环内；非瞬态错误立即抛出
+    last_err = None
+    for attempt in range(5):
         try:
-            if os.path.abspath(open_doc.FullName).lower() == abs_dwg.lower():
-                doc = open_doc
-                break
-        except Exception:
-            continue
-    if doc is None:
-        # win32com 动态分发下 Open 的返回值不可靠（会拿到方法包装对象），
-        # 显式标记为方法后调用，再从 ActiveDocument / Documents 集合取回文档对象
-        acad.Documents._FlagAsMethod("Open")
-        acad.Documents.Open(abs_dwg)
-        for _ in range(60):
-            try:
-                active = acad.ActiveDocument
-                if os.path.abspath(active.FullName).lower() == abs_dwg.lower():
-                    doc = active
-                    break
-            except Exception:
-                pass
-            time.sleep(1)
-        if doc is None:
+            # 连接（或启动）AutoCAD
+            acad = win32com.client.Dispatch("AutoCAD.Application")
+            acad.Visible = True
+
+            # 若该图纸已在 AutoCAD 中打开则直接激活，否则重新打开
+            doc = None
             for open_doc in acad.Documents:
-                if os.path.abspath(open_doc.FullName).lower() == abs_dwg.lower():
-                    doc = open_doc
-                    break
-    doc.Activate()
+                try:
+                    if os.path.abspath(open_doc.FullName).lower() == abs_dwg.lower():
+                        doc = open_doc
+                        break
+                except Exception:
+                    continue
+            if doc is None:
+                # win32com 动态分发下 Open 的返回值不可靠（会拿到方法包装对象），
+                # 显式标记为方法后调用，再从 ActiveDocument / Documents 集合取回文档对象
+                acad.Documents._FlagAsMethod("Open")
+                acad.Documents.Open(abs_dwg)
+                for _ in range(60):
+                    try:
+                        active = acad.ActiveDocument
+                        if os.path.abspath(active.FullName).lower() == abs_dwg.lower():
+                            doc = active
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                if doc is None:
+                    for open_doc in acad.Documents:
+                        try:
+                            if os.path.abspath(open_doc.FullName).lower() == abs_dwg.lower():
+                                doc = open_doc
+                                break
+                        except Exception:
+                            continue
+            doc.Activate()
+            break  # 连接+打开成功，跳出 retry 循环
+        except Exception as e:
+            last_err = e
+            if _is_com_call_rejected(e):
+                # AutoCAD 忙，等 0.5s 后重试
+                time.sleep(0.5)
+                continue
+            raise  # 非瞬态错误直接抛出
+    else:
+        # 5 次重试都被拒绝，抛出最后一次异常
+        raise last_err
 
     drawn, failed = _draw_on_doc(doc, points)
 
