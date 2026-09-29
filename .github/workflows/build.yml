@@ -15,10 +15,27 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.ver.outputs.v }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # 解析版本号：tag push 用 tag 名（如 v1.0.4）；手动触发用输入的 tag；
+      # 两者都不是（手动触发且未填 tag）则用 dev
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            V="${{ inputs.tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            V="${{ github.ref_name }}"
+          else
+            V="dev"
+          fi
+          echo "v=$V" >> "$GITHUB_OUTPUT"
 
       - name: Create Executable
         uses: sayyid5416/pyinstaller@v1
@@ -26,8 +43,20 @@ jobs:
           python_ver: '3.11'
           spec: 'AutoDraw.py'
           requirements: 'requirements.txt'
-          upload_exe_with_name: 'AutoDraw'
           options: --onefile, --name "AutoDraw", --windowed, --icon AutoDraw.ico, --add-data "AutoDraw.ico;.", --collect-all rapidocr, --collect-all onnxruntime, --hidden-import onnxruntime, --hidden-import onnxruntime.capi, --collect-submodules onnxruntime
+
+      # 打包产物重命名加版本号：dist/AutoDraw.exe -> dist/AutoDraw_v1.0.4.exe
+      - name: Rename exe with version
+        shell: pwsh
+        run: Copy-Item dist\AutoDraw.exe "dist\AutoDraw_${{ steps.ver.outputs.v }}.exe"
+
+      # 不再使用 pyinstaller action 自带的 upload_exe_with_name，
+      # 改为自己上传带版本号的产物（artifact 名与文件名都含版本号）
+      - name: Upload versioned exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoDraw_${{ steps.ver.outputs.v }}
+          path: dist/AutoDraw_${{ steps.ver.outputs.v }}.exe
 
   release:
     needs: build
@@ -40,10 +69,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 按带版本号的 artifact 名下载，文件名已是 AutoDraw_<版本>.exe
       - name: Download built exe
         uses: actions/download-artifact@v4
         with:
-          name: AutoDraw
+          name: AutoDraw_${{ needs.build.outputs.version }}
           path: exe
 
       - name: Attach exe to GitHub Release
