@@ -11,6 +11,8 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import time
+import threading
+import queue
 import win32com.client
 import pythoncom
 
@@ -34,10 +36,11 @@ ZOOM_MARGIN = 5.0        # 绘制完成后视图缩放到绘制区域时的外�
 
 APP_USER_MODEL_ID = 'AutoDraw.AutoCAD.CoordinateTool'  # 任务栏归组与图标标识
 
-# AutoCAD 颜色索引 (ACI) 到中文名映射，用于窗体下拉框显示
+# AutoCAD 颜色索引 (ACI) 到中文名映射，用于窗体下拉框显示；256=ByLayer（随图层）
 _ACI_COLORS = [
     (1, '红'), (2, '黄'), (3, '绿'), (4, '青'),
     (5, '蓝'), (6, '紫'), (7, '白'), (8, '灰'),
+    (256, 'ByLayer'),
 ]
 _ACI_TO_NAME = {i: n for i, n in _ACI_COLORS}
 _NAME_TO_ACI = {n: i for i, n in _ACI_COLORS}
@@ -45,6 +48,9 @@ _NAME_TO_ACI = {n: i for i, n in _ACI_COLORS}
 # 主 root 引用（batch_process 创建后存到这里，便于 if __name__ 调用 mainloop
 # 阻塞等用户关闭日志窗）
 _ROOT = None
+_LOG_REDIRECTOR = None  # 主线程日志重定向器，供后台线程安全调用 tkinter API
+_PROGRESS_VAR = None    # 进度条 DoubleVar
+_PROGRESS_LABEL = None  # 进度百分比 Label
 
 
 def _resource_path(rel_name):
@@ -72,30 +78,84 @@ def _apply_window_icon(root):
 class _LogWindowRedirector:
     """将 print 输出重定向到日志窗体 Text 控件，同时保留原 stdout 输出。
 
-    兼容打包后 --windowed 模式（无控制台）：原 stdout 可能为 None，
-    写入失败时静默跳过，不影响日志窗体显示。
+    线程安全：处理逻辑在后台线程运行，print 产生的内容先放入线程安全队列，
+    由主线程通过 root.after() 轮询取出并写入 Text 控件（tkinter 只能在主线程操作）。
+    兼容打包后 --windowed 模式（无控制台）：原 stdout 可能为 None，写入失败时静默跳过。
     """
 
-    def __init__(self, text_widget, original_stdout=None):
+    def __init__(self, text_widget, root, original_stdout=None):
         self.text = text_widget
+        self.root = root
         self.original = original_stdout
+        self._queue = queue.Queue()
+        self._ui_queue = queue.Queue()  # 需在主线程执行的任务（如 messagebox）
         # 关键 emoji 前缀 -> Text tag 名（用于着色）
         self._tag_rules = (
             ('✅', 'ok'), ('❌', 'err'), ('⚠️', 'warn'),
             ('📝', 'info'), ('🔧', 'info'), ('🚀', 'info'),
             ('📌', 'info'), ('🎯', 'info'), ('📁', 'info'),
         )
+        # 启动主线程轮询：每 50ms 批量取出队列中的日志写入 Text，并执行主线程任务
+        self._poll()
+
+    def run_on_main(self, func, *args, **kwargs):
+        """在主线程执行 func 并阻塞等待返回值（线程安全）。
+
+        用于后台线程调用 tkinter API（如 messagebox）。
+        """
+        done = threading.Event()
+        box = {}
+
+        def _task():
+            try:
+                box['r'] = func(*args, **kwargs)
+            except Exception as e:
+                box['e'] = e
+            finally:
+                done.set()
+
+        self._ui_queue.put(_task)
+        done.wait()
+        if 'e' in box:
+            raise box['e']
+        return box.get('r')
+
+    def _poll(self):
+        """主线程轮询：批量取出日志写入 Text，并执行主线程任务队列。"""
+        try:
+            while True:
+                content = self._queue.get_nowait()
+                self._append_to_text(content)
+        except queue.Empty:
+            pass
+        # 执行需在主线程运行的任务（如 messagebox）
+        try:
+            while True:
+                task = self._ui_queue.get_nowait()
+                task()
+        except queue.Empty:
+            pass
+        # 递归调度下一次轮询（仅在 root 仍存活时）
+        try:
+            self.root.after(50, self._poll)
+        except Exception:
+            pass
 
     def write(self, content):
-        # 同步写入 Text 控件 + update_idletasks 立即刷新：
-        # print 在主线程同步调用，OCR 等长任务期间 mainloop 未运行，
-        # after() 调度的任务不会执行，必须同步刷新才能让日志实时显示
-        self._append(content)
+        """后台线程调用：仅放入队列，不直接操作 UI。"""
+        if content:
+            self._queue.put(content)
+        # 同步写原 stdout（IDE 控制台/打包后可能为 None）
+        if self.original is not None:
+            try:
+                self.original.write(content)
+            except Exception:
+                pass
 
-    def _append(self, content):
+    def _append_to_text(self, content):
+        """主线程调用：实际写入 Text 控件。"""
         if not content:
             return
-        # 选 tag：按行首 emoji 匹配
         tag = ''
         for emoji, tag_name in self._tag_rules:
             if emoji in content:
@@ -107,16 +167,9 @@ class _LogWindowRedirector:
             else:
                 self.text.insert(tk.END, content)
             self.text.see(tk.END)
-            self.text.update_idletasks()
         except Exception:
-            # 日志窗已被用户关闭：Text 控件已销毁，仅写原 stdout
+            # 日志窗已被用户关闭：Text 控件已销毁
             pass
-        # 同步写原 stdout（IDE 控制台/打包后可能为 None）
-        if self.original is not None:
-            try:
-                self.original.write(content)
-            except Exception:
-                pass
 
     def flush(self):
         if self.original is not None:
@@ -124,6 +177,41 @@ class _LogWindowRedirector:
                 self.original.flush()
             except Exception:
                 pass
+
+
+def _msg(func, title, msg, root):
+    """线程安全的 messagebox 调用：后台线程通过此函数在主线程弹窗。"""
+    if _LOG_REDIRECTOR is not None:
+        return _LOG_REDIRECTOR.run_on_main(func, title, msg, parent=root)
+    # 兜底（redirector 未初始化时直接调用，仅限主线程场景）
+    return func(title, msg, parent=root)
+
+
+def _set_progress(fraction):
+    """线程安全地更新进度条。
+
+    fraction: 0.0 ~ 1.0，进度条显示为百分比。
+    主线程调用直接更新；后台线程通过 run_on_main 调度到主线程更新。
+    """
+    fraction = max(0.0, min(1.0, fraction))
+    pct = int(round(fraction * 100))
+
+    def _update():
+        if _PROGRESS_VAR is not None:
+            _PROGRESS_VAR.set(pct)
+        if _PROGRESS_LABEL is not None:
+            _PROGRESS_LABEL.config(text=f"{pct}%")
+
+    # 主线程直接更新；后台线程通过 redirector 调度到主线程
+    if threading.current_thread() is threading.main_thread():
+        _update()
+    elif _LOG_REDIRECTOR is not None:
+        try:
+            _LOG_REDIRECTOR.run_on_main(_update)
+        except Exception:
+            pass
+    else:
+        _update()
 
 
 def _create_main_window():
@@ -248,7 +336,21 @@ def _create_main_window():
     for c in range(6):
         param_frame.grid_columnconfigure(c, weight=1 if c % 2 else 0)
 
-    # ---- 底栏：日志区 ----
+    # ---- 进度条（绘图参数与运行日志之间）----
+    prog_frame = tk.Frame(root)
+    prog_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
+    tk.Label(prog_frame, text="进度：", font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
+    _progress_var = tk.DoubleVar(value=0.0)
+    progress_bar = ttk.Progressbar(prog_frame, variable=_progress_var,
+                                    maximum=100, mode='determinate')
+    progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+    _progress_label = tk.Label(prog_frame, text="0%", font=("Microsoft YaHei", 9), width=6)
+    _progress_label.pack(side=tk.LEFT, padx=(4, 0))
+    global _PROGRESS_VAR, _PROGRESS_LABEL
+    _PROGRESS_VAR = _progress_var
+    _PROGRESS_LABEL = _progress_label
+
+    # ---- 底栏：日志区（白色背景）----
     bot = tk.LabelFrame(root, text="运行日志", font=("Microsoft YaHei", 10),
                         padx=8, pady=6)
     bot.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
@@ -257,23 +359,25 @@ def _create_main_window():
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
     log_text = tk.Text(bot, wrap=tk.CHAR, font=("Consolas", 10),
-                       bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4",
+                       bg="#ffffff", fg="#1e1e1e", insertbackground="#1e1e1e",
                        yscrollcommand=scrollbar.set)
     log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     scrollbar.config(command=log_text.yview)
 
-    # 颜色 tag
-    log_text.tag_config('ok', foreground='#4ec9b0')     # 绿
-    log_text.tag_config('err', foreground='#f48771')   # 红
-    log_text.tag_config('warn', foreground='#dcdcaa')  # 黄
-    log_text.tag_config('info', foreground='#569cd6')  # 蓝
+    # 颜色 tag（适配白色背景）
+    log_text.tag_config('ok', foreground='#008000')     # 绿
+    log_text.tag_config('err', foreground='#d00000')    # 红
+    log_text.tag_config('warn', foreground='#b8860b')   # 暗黄
+    log_text.tag_config('info', foreground='#0066cc')   # 蓝
 
     # ---- stdout 重定向到日志 Text ----
     import sys
     if not hasattr(_create_main_window, '_orig_stdout'):
         _create_main_window._orig_stdout = sys.stdout
-    redirector = _LogWindowRedirector(log_text, _create_main_window._orig_stdout)
+    redirector = _LogWindowRedirector(log_text, root, _create_main_window._orig_stdout)
     sys.stdout = redirector
+    global _LOG_REDIRECTOR
+    _LOG_REDIRECTOR = redirector  # 存模块级引用，供后台线程安全调用 messagebox 等
 
     # ---- 回调：更新路径 Entry 关联的 StringVar ----
     def _update_browse_state():
@@ -300,8 +404,8 @@ def _create_main_window():
             if paths:
                 docx_paths_ref.clear()
                 docx_paths_ref.extend(paths)
-                # 显示完整路径（多选以分号分隔），便于用户核对
-                docx_paths_str.set("；".join(paths))
+                # 只显示文件名（多选以分号分隔），完整路径保留在 docx_paths_ref 中
+                docx_paths_str.set("；".join(os.path.basename(p) for p in paths))
                 folder_path.set('')
         _check_start_ready()
 
@@ -321,13 +425,35 @@ def _create_main_window():
         has_dwg = bool(dwg_path.get())
         start_btn.config(state=tk.NORMAL if (has_source and has_dwg) else tk.DISABLED)
 
+    def _restore_ui():
+        """恢复所有控件为可用状态（在主线程执行）。"""
+        start_btn.config(state=tk.NORMAL, text="▶  开始处理")
+        browse_btn.config(state=tk.NORMAL)
+        for child in top.winfo_children():
+            try:
+                child.config(state=tk.NORMAL)
+            except tk.TclError:
+                pass
+        for child in param_frame.winfo_children():
+            try:
+                child.config(state=tk.NORMAL)
+            except tk.TclError:
+                pass
+        _check_start_ready()
+        print("\n提示：可重新选择路径并继续处理下一批，或关闭窗口退出程序。")
+
     def _start_processing():
-        """点击开始：禁用按钮，调 batch_process，结束后重新启用"""
+        """点击开始：禁用按钮，后台线程运行 batch_process，结束后恢复控件。
+
+        处理在后台线程执行，主线程保持响应（窗口可拖动、日志实时刷新）。
+        """
         folder = folder_path.get() if source_type.get() == 'folder' else None
         docx = tuple(docx_paths_ref) if source_type.get() == 'docx' else ()
         dwg = dwg_path.get()
         # 清空日志区，避免上一次的输出残留（保持 NORMAL 状态：DISABLED 会阻止程序 insert）
         log_text.delete('1.0', tk.END)
+        # 重置进度条为 0%
+        _set_progress(0.0)
         # 应用绘图参数：读取 Entry 值，按类型转换更新模块级常量
         # 解析失败或留空时保留原默认值，仅打印警告
         _apply_params()
@@ -345,28 +471,26 @@ def _create_main_window():
             except tk.TclError:
                 pass
         root.update_idletasks()
-        try:
-            batch_process(folder, docx, dwg, root)
-        except Exception as e:
-            print(f"\n💥 程序异常终止: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            # 恢复按钮，允许用户重新选择并再次处理
-            start_btn.config(state=tk.NORMAL, text="▶  开始处理")
-            browse_btn.config(state=tk.NORMAL)
-            for child in top.winfo_children():
-                try:
-                    child.config(state=tk.NORMAL)
-                except tk.TclError:
-                    pass
-            for child in param_frame.winfo_children():
-                try:
-                    child.config(state=tk.NORMAL)
-                except tk.TclError:
-                    pass
-            _check_start_ready()
-            print("\n提示：可重新选择路径并继续处理下一批，或关闭窗口退出程序。")
+
+        def _worker():
+            """后台线程：执行 batch_process，结束后在主线程恢复 UI。"""
+            # 后台线程必须初始化 COM 库（STA 模式），否则 win32com 创建的
+            # AutoCAD COM 代理会失效，出现 "<unknown>.Layers" 等错误
+            pythoncom.CoInitialize()
+            try:
+                batch_process(folder, docx, dwg, root)
+            except Exception as e:
+                print(f"\n💥 程序异常终止: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                # 恢复 UI 必须在主线程（tkinter 非线程安全）
+                if _LOG_REDIRECTOR is not None:
+                    _LOG_REDIRECTOR.run_on_main(_restore_ui)
+                else:
+                    _restore_ui()
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _apply_params():
         """读取参数 Entry/Combobox，按声明类型转换并更新模块级常量。
@@ -604,8 +728,10 @@ def _is_com_call_rejected(exc):
             hr = int(exc.args[0])
         except (TypeError, ValueError):
             pass
-    # RPC_E_CALL_REJECTED (0x80010001)
-    if hr == -2147418111:
+    # 可重试的瞬态 COM 错误：
+    #   RPC_E_CALL_REJECTED      (0x80010001) -2147418111  "被呼叫方拒绝接收呼叫"
+    #   RPC_E_SERVERCALL_RETRYLATER (0x8001010A) -2147417846  "消息筛选器显示应用程序正在使用中"
+    if hr in (-2147418111, -2147417846):
         return True
     # 偶发 win32com 属性解析错误（"Property 'X' can not be set"）
     msg = str(exc)
@@ -627,12 +753,13 @@ def _draw_on_doc(doc, points):
     model_space = doc.ModelSpace
     drawn = 0
     failed = []
-    for easting, northing, elevation, suffix, source_file in points:
+    total_pts = len(points)
+    for pi, (easting, northing, elevation, suffix, source_file) in enumerate(points):
         # AutoCAD 处于忙状态时会拒绝 COM 调用 (RPC_E_CALL_REJECTED)，
         # 单个点的绘制流程作为 retry 单元：失败时清理半成品圆后短暂等待重试，
-        # 最多 3 次。非 RPC 拒绝错误直接记录失败不重试。
+        # 最多 5 次。非 RPC 拒绝错误直接记录失败不重试。
         last_err = None
-        for attempt in range(3):
+        for attempt in range(5):
             circle = None
             try:
                 # ---- 红色圆（图层：长崖边巷道）----
@@ -669,7 +796,7 @@ def _draw_on_doc(doc, points):
                     except Exception:
                         pass
                 last_err = e
-                if _is_com_call_rejected(e) and attempt < 2:
+                if _is_com_call_rejected(e) and attempt < 4:
                     # RPC 调用被拒绝：短暂等待让 AutoCAD 处理完手头工作再 retry
                     time.sleep(0.5)
                     continue
@@ -680,6 +807,8 @@ def _draw_on_doc(doc, points):
             reason = str(last_err).replace('\n', ' ')[:200]
             failed.append((source_file, f"绘制失败: {reason}"))
             print(f"   ❌ 绘制失败: {source_file} -> {reason}")
+        # 绘图阶段占总进度的后 50%（50% ~ 100%）
+        _set_progress(0.5 + (pi + 1) / total_pts * 0.5)
 
     return drawn, failed
 
@@ -733,6 +862,9 @@ def draw_circles_on_dwg(dwg_path, points):
                         except Exception:
                             continue
             doc.Activate()
+            # 连接/打开成功后短暂等待 AutoCAD 完成初始化（尤其是程序刚启动 CAD 的场景），
+            # 减少后续绘图阶段 RPC_E_CALL_REJECTED 的概率
+            time.sleep(1.0)
             break  # 连接+打开成功，跳出 retry 循环
         except Exception as e:
             last_err = e
@@ -770,7 +902,7 @@ def draw_circles_on_dwg(dwg_path, points):
                 acad.ZoomWindow(lower, upper)
                 break
             except Exception as e:
-                if _is_com_call_rejected(e) and attempt < 2:
+                if _is_com_call_rejected(e) and attempt < 4:
                     time.sleep(0.5)
                     continue
                 # 重试用尽或非重试错误：缩放失败不影响已绘制内容
@@ -1053,7 +1185,8 @@ def batch_process(folder_path, docx_paths, dwg_path, root):
     valid_points = []   # [(东坐标, 北坐标, 高程, 后缀, 文件名), ...]
     failures = []       # [(图片完整路径, 文件名, 失败原因), ...]
     total_images = len(image_list)
-    for full_path, filename, note in image_list:
+    _set_progress(0.0)
+    for idx, (full_path, filename, note) in enumerate(image_list):
         result = extract_coords(full_path)
 
         # 5. 打印识别结果
@@ -1090,6 +1223,8 @@ def batch_process(folder_path, docx_paths, dwg_path, root):
             failures.append((full_path, filename, reason))
         # 分隔线统一在每张图片处理结束后打印（含备注应用情况）
         print("-" * 50)
+        # OCR 阶段占总进度的 50%
+        _set_progress((idx + 1) / total_images * 0.5)
 
     # 归档基础目录：有文件夹用文件夹；仅 docx 时用第一个 docx 所在目录，
     # 避免归档目录建在 temp_dir 内被清理时误删。
@@ -1102,12 +1237,13 @@ def batch_process(folder_path, docx_paths, dwg_path, root):
 
     if not valid_points:
         print("\n⚠️ 没有识别到可用坐标，无需绘图。")
+        _set_progress(1.0)
         archive_dir = archive_failed_images(archive_base, failures) if archive_base else None
         msg = f"共扫描 {total_images} 张图片，未识别到任何可用坐标。"
         if archive_dir:
             msg += f"\n失败图片已保存至:\n{archive_dir}"
         print(msg)
-        messagebox.showwarning("处理完成（无有效坐标）", msg, parent=root)
+        _msg(messagebox.showwarning, "处理完成（无有效坐标）", msg, root)
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
         return
@@ -1152,20 +1288,22 @@ def batch_process(folder_path, docx_paths, dwg_path, root):
 
     if cad_fatal:
         msg = f"AutoCAD 绘图失败：{cad_fatal}\n\n失败图片已保存至:\n{archive_dir or archive_base}"
-        messagebox.showerror("处理异常", msg, parent=root)
+        _msg(messagebox.showerror, "处理异常", msg, root)
     else:
         msg = f"处理完成！\n\n共扫描图片：{total_images} 张\n成功绘制：{count} 个\n失败：{len(failures)} 个"
         if archive_dir:
             msg += f"\n\n失败图片已保存至:\n{archive_dir}"
         msg += "\n\n图纸保持打开，确认无误后请按 Ctrl+S 保存。"
         if failures:
-            messagebox.showwarning("处理完成（存在失败项）", msg, parent=root)
+            _msg(messagebox.showwarning, "处理完成（存在失败项）", msg, root)
         else:
-            messagebox.showinfo("处理完成", msg, parent=root)
+            _msg(messagebox.showinfo, "处理完成", msg, root)
 
     # 清理 docx 临时提取目录（失败图片已复制到归档目录，原临时文件可删）
     if temp_dir:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+    _set_progress(1.0)  # 处理完成，进度 100%
 
 
 if __name__ == "__main__":
