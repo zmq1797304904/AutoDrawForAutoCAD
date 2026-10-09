@@ -1,6 +1,8 @@
 opencv-python==4.10.0.84
 numpy==1.26.4
 pywin32==312
-rapidocr
-onnxruntime
-python-docx
+# RapidOCR 3.x 返回 RapidOCROutput（字段 txts/boxes），本程序直接依赖该结构。
+# 不锁版本时上游一旦改结构，getattr 会取到 None，表现为"所有图片静默识别失败"。
+rapidocr==3.9.2
+onnxruntime>=1.17,<2
+python-docx>=1.1,<2

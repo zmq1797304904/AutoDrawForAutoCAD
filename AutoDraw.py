@@ -19,6 +19,15 @@ import pythoncom
 # RapidOCR 引擎单例：模型只加载一次。首次运行会自动下载 ONNX 模型。
 _OCR_ENGINE = None
 
+
+class _OCREngineError(RuntimeError):
+    """OCR 引擎层面的故障（如返回结构不兼容），区别于单张图片的识别失败。
+
+    这类错误对每张图片都会重复出现，若被当作单图失败吞掉，用户只会看到
+    "全部识别失败"而拿不到根因，因此 extract_coords 会把它原样抛出。
+    """
+
+
 # 绘图参数
 CIRCLE_RADIUS = 0.5   # 圆半径 0.5m
 CIRCLE_COLOR = 1      # AutoCAD 颜色索引：1=红(acRed)
@@ -33,6 +42,19 @@ TEXT_WIDTH_FACTOR = 0.8  # 文字宽度因子
 TEXT_COLOR = 3           # AutoCAD 颜色索引：3=绿(acGreen)
 TEXT_STYLE = 'Standard'  # 文字样式
 ZOOM_MARGIN = 5.0        # 绘制完成后视图缩放到绘制区域时的外扩边距（米）
+
+# COM 瞬态错误重试参数：AutoCAD 忙时会拒绝 RPC 调用，需等待后重试
+COM_RETRY_ATTEMPTS = 5   # 连接/打开图纸、单个坐标点绘制的重试次数
+COM_ZOOM_ATTEMPTS = 3    # 视图缩放的重试次数
+COM_RETRY_DELAY = 0.5    # 每次重试前的等待秒数
+
+# 图层名的非法字符：AutoCAD 不接受这些符号，含则建图层必失败
+_LAYER_ILLEGAL_CHARS = set('<>/\\":;?*|=,')
+
+# 东/北坐标与高程的量级分界。地球最高点约 8848 m，而测量用的投影坐标即使采用
+# 局部坐标系也基本在万米以上（实测东坐标 3.7e7、北坐标 3.5e6、高程约 350），
+# 因此用 1e4 把高程与平距/高差之类的小数值同坐标区分开。
+COORD_MIN_MAGNITUDE = 1e4
 
 APP_USER_MODEL_ID = 'AutoDraw.AutoCAD.CoordinateTool'  # 任务栏归组与图标标识
 
@@ -89,20 +111,32 @@ class _LogWindowRedirector:
         self.original = original_stdout
         self._queue = queue.Queue()
         self._ui_queue = queue.Queue()  # 需在主线程执行的任务（如 messagebox）
+        # 主窗关闭时置位：唤醒所有阻塞在 run_on_main 的后台线程，避免永久挂起
+        self._closed = threading.Event()
+        # Text 控件最多保留的行数，超出后删除最前面的内容，防止长任务内存膨胀
+        self._max_lines = 5000
         # 关键 emoji 前缀 -> Text tag 名（用于着色）
         self._tag_rules = (
             ('✅', 'ok'), ('❌', 'err'), ('⚠️', 'warn'),
             ('📝', 'info'), ('🔧', 'info'), ('🚀', 'info'),
             ('📌', 'info'), ('🎯', 'info'), ('📁', 'info'),
+            ('📄', 'info'), ('⚙️', 'info'), ('💥', 'err'),
         )
         # 启动主线程轮询：每 50ms 批量取出队列中的日志写入 Text，并执行主线程任务
         self._poll()
 
+    def close(self):
+        """主窗关闭时调用：通知后台线程停止等待。"""
+        self._closed.set()
+
     def run_on_main(self, func, *args, **kwargs):
         """在主线程执行 func 并阻塞等待返回值（线程安全）。
 
-        用于后台线程调用 tkinter API（如 messagebox）。
+        用于后台线程调用 tkinter API（如 messagebox）。主窗关闭后立即抛出，
+        避免后台线程永远阻塞在等待上。messagebox 需要等用户点击，故不设超时。
         """
+        if self._closed.is_set():
+            raise RuntimeError("主窗口已关闭，操作已取消")
         done = threading.Event()
         box = {}
 
@@ -115,10 +149,21 @@ class _LogWindowRedirector:
                 done.set()
 
         self._ui_queue.put(_task)
-        done.wait()
+        while not done.wait(0.2):
+            if self._closed.is_set():
+                raise RuntimeError("主窗口已关闭，操作已取消")
         if 'e' in box:
             raise box['e']
         return box.get('r')
+
+    def post_to_main(self, func):
+        """把任务投递到主线程执行，不等待结果。
+
+        进度条等无需返回值的场景使用，避免后台线程为每次更新做一次
+        最长 50ms 的同步往返（大量点时累计可达数十秒）。
+        """
+        if not self._closed.is_set():
+            self._ui_queue.put(func)
 
     def _poll(self):
         """主线程轮询：批量取出日志写入 Text，并执行主线程任务队列。"""
@@ -132,7 +177,11 @@ class _LogWindowRedirector:
         try:
             while True:
                 task = self._ui_queue.get_nowait()
-                task()
+                try:
+                    task()
+                except Exception:
+                    # 单个任务失败不能中断轮询，否则所有后续日志与弹窗都会丢失
+                    pass
         except queue.Empty:
             pass
         # 递归调度下一次轮询（仅在 root 仍存活时）
@@ -166,6 +215,9 @@ class _LogWindowRedirector:
                 self.text.insert(tk.END, content, (tag,))
             else:
                 self.text.insert(tk.END, content)
+            # 长任务会把 Text 撑到几十万行，这里按行数上限裁剪最前面的内容
+            if int(self.text.index('end-1c').split('.')[0]) > self._max_lines:
+                self.text.delete('1.0', f'{self._max_lines // 5}.0')
             self.text.see(tk.END)
         except Exception:
             # 日志窗已被用户关闭：Text 控件已销毁
@@ -202,14 +254,11 @@ def _set_progress(fraction):
         if _PROGRESS_LABEL is not None:
             _PROGRESS_LABEL.config(text=f"{pct}%")
 
-    # 主线程直接更新；后台线程通过 redirector 调度到主线程
+    # 主线程直接更新；后台线程投递给主线程（不等待，避免逐点同步往返累积延迟）
     if threading.current_thread() is threading.main_thread():
         _update()
     elif _LOG_REDIRECTOR is not None:
-        try:
-            _LOG_REDIRECTOR.run_on_main(_update)
-        except Exception:
-            pass
+        _LOG_REDIRECTOR.post_to_main(_update)
     else:
         _update()
 
@@ -230,14 +279,37 @@ def _create_main_window():
     """
     root = tk.Tk()
     root.title("AutoDraw - 自动绘制坐标")
-    root.geometry("900x720")
     root.minsize(700, 500)
+    # 窗口水平+垂直居中显示（用固定尺寸计算，避免 winfo 在窗口未完全绘制时返回 1）
+    _WIN_W, _WIN_H = 1000, 720
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    # Windows 任务栏占用底部空间，可用高度需减去约 50px（任务栏默认高度）
+    _TASKBAR = 50
+    avail_h = sh - _TASKBAR
+    x = max(0, (sw - _WIN_W) // 2)
+    y = max(0, (avail_h - _WIN_H) // 2)
+    root.geometry(f"{_WIN_W}x{_WIN_H}+{x}+{y}")
     _apply_window_icon(root)
+
+    # 处理中标志：防止重复启动 worker 线程，并让关窗时能提醒用户
+    _busy = {'on': False}
 
     # 主窗关闭 = 程序退出
     def _on_close():
         import sys
+        if _busy['on']:
+            # 处理中关窗会直接切断进行中的 COM 调用，AutoCAD 可能留下半成品图形
+            if not messagebox.askyesno(
+                "正在处理中",
+                "绘图任务尚未结束。强行退出可能让 AutoCAD 留下绘制到一半的图形。\n\n确定要退出吗？",
+                parent=root,
+            ):
+                return
         sys.stdout = getattr(_create_main_window, '_orig_stdout', sys.__stdout__)
+        # 通知后台线程停止等待主线程，否则 run_on_main 会永久挂起
+        if _LOG_REDIRECTOR is not None:
+            _LOG_REDIRECTOR.close()
         root.quit()
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", _on_close)
@@ -260,12 +332,14 @@ def _create_main_window():
     row1.pack(fill=tk.X, pady=(0, 6))
 
     tk.Label(row1, text="图片来源：", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
-    tk.Radiobutton(row1, text="图片文件夹", variable=source_type, value='folder',
-                   font=("Microsoft YaHei", 10),
-                   command=lambda: _update_browse_state()).pack(side=tk.LEFT, padx=(4, 8))
-    tk.Radiobutton(row1, text="Word 文档(.docx)", variable=source_type, value='docx',
-                   font=("Microsoft YaHei", 10),
-                   command=lambda: _update_browse_state()).pack(side=tk.LEFT, padx=4)
+    folder_radio = tk.Radiobutton(row1, text="图片文件夹", variable=source_type, value='folder',
+                                  font=("Microsoft YaHei", 10),
+                                  command=lambda: _update_browse_state())
+    folder_radio.pack(side=tk.LEFT, padx=(4, 8))
+    docx_radio = tk.Radiobutton(row1, text="Word 文档(.docx)", variable=source_type, value='docx',
+                                font=("Microsoft YaHei", 10),
+                                command=lambda: _update_browse_state())
+    docx_radio.pack(side=tk.LEFT, padx=4)
 
     path_entry = tk.Entry(row1, font=("Microsoft YaHei", 10),
                           textvariable=folder_path if source_type.get() == 'folder' else docx_paths_str,
@@ -282,11 +356,13 @@ def _create_main_window():
     row2.pack(fill=tk.X, pady=(0, 8))
 
     tk.Label(row2, text="目标 DWG：", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
-    tk.Entry(row2, font=("Microsoft YaHei", 10),
-             textvariable=dwg_path, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 4))
-    tk.Button(row2, text="浏览...", width=8,
-              font=("Microsoft YaHei", 10),
-              command=lambda: _browse_dwg()).pack(side=tk.LEFT)
+    dwg_entry = tk.Entry(row2, font=("Microsoft YaHei", 10),
+                         textvariable=dwg_path, state='readonly')
+    dwg_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 4))
+    dwg_browse_btn = tk.Button(row2, text="浏览...", width=8,
+                               font=("Microsoft YaHei", 10),
+                               command=lambda: _browse_dwg())
+    dwg_browse_btn.pack(side=tk.LEFT)
 
     # 行3：开始处理按钮（居中）
     row3 = tk.Frame(top)
@@ -315,6 +391,14 @@ def _create_main_window():
     ]
     param_vars = {}    # 常量名 -> StringVar
     param_types = {}   # 常量名 -> 类型
+    param_widgets = {}  # 常量名 -> 输入控件（用于统一启停）
+    # 数值参数的合理区间 (下界, 上界)，要求 下界 < 值 <= 上界
+    _param_ranges = {
+        'CIRCLE_RADIUS': (0.0, 1e6),
+        'TEXT_HEIGHT': (0.0, 1e6),
+        'TEXT_WIDTH_FACTOR': (0.0, 100.0),
+        'ZOOM_MARGIN': (0.0, 1e6),
+    }
     for i, (name, label, default, ptype) in enumerate(_param_defs):
         row = i // 3
         col = (i % 3) * 2
@@ -323,15 +407,17 @@ def _create_main_window():
         var = tk.StringVar(value=default)
         if ptype == 'color':
             # 颜色用 Combobox 下拉框显示中文名，readonly 防止用户输入任意值
-            ttk.Combobox(param_frame, textvariable=var,
-                         values=[n for _, n in _ACI_COLORS],
-                         width=12, state='readonly',
-                         font=("Microsoft YaHei", 9)).grid(row=row, column=col + 1, sticky='we', padx=2, pady=2)
+            widget = ttk.Combobox(param_frame, textvariable=var,
+                                  values=[n for _, n in _ACI_COLORS],
+                                  width=12, state='readonly',
+                                  font=("Microsoft YaHei", 9))
         else:
-            tk.Entry(param_frame, textvariable=var, width=14,
-                     font=("Microsoft YaHei", 9)).grid(row=row, column=col + 1, sticky='we', padx=2, pady=2)
+            widget = tk.Entry(param_frame, textvariable=var, width=14,
+                              font=("Microsoft YaHei", 9))
+        widget.grid(row=row, column=col + 1, sticky='we', padx=2, pady=2)
         param_vars[name] = var
         param_types[name] = ptype
+        param_widgets[name] = widget
     # 列权重让 Entry 随窗口缩放伸展
     for c in range(6):
         param_frame.grid_columnconfigure(c, weight=1 if c % 2 else 0)
@@ -425,20 +511,33 @@ def _create_main_window():
         has_dwg = bool(dwg_path.get())
         start_btn.config(state=tk.NORMAL if (has_source and has_dwg) else tk.DISABLED)
 
+    def _set_controls_enabled(enabled):
+        """统一启停输入控件。
+
+        readonly 的 Entry/Combobox 恢复时必须还原为 readonly：原先一律设成
+        NORMAL 会把路径框和颜色下拉框解锁成可自由编辑。
+        start_btn 不在此处处理，它的可用性取决于路径是否选齐。
+        """
+        state = tk.NORMAL if enabled else tk.DISABLED
+        browse_btn.config(state=state)
+        dwg_browse_btn.config(state=state)
+        folder_radio.config(state=state)
+        docx_radio.config(state=state)
+        # 注意：tkinter 没有 tk.READONLY 常量，只读态就是字符串 'readonly'
+        path_entry.config(state='readonly' if enabled else tk.DISABLED)
+        dwg_entry.config(state='readonly' if enabled else tk.DISABLED)
+        for name, widget in param_widgets.items():
+            try:
+                widget.config(state=('readonly' if param_types[name] == 'color'
+                                     else tk.NORMAL) if enabled else tk.DISABLED)
+            except tk.TclError:
+                pass
+
     def _restore_ui():
         """恢复所有控件为可用状态（在主线程执行）。"""
-        start_btn.config(state=tk.NORMAL, text="▶  开始处理")
-        browse_btn.config(state=tk.NORMAL)
-        for child in top.winfo_children():
-            try:
-                child.config(state=tk.NORMAL)
-            except tk.TclError:
-                pass
-        for child in param_frame.winfo_children():
-            try:
-                child.config(state=tk.NORMAL)
-            except tk.TclError:
-                pass
+        _busy['on'] = False
+        _set_controls_enabled(True)
+        start_btn.config(text="▶  开始处理")
         _check_start_ready()
         print("\n提示：可重新选择路径并继续处理下一批，或关闭窗口退出程序。")
 
@@ -447,6 +546,11 @@ def _create_main_window():
 
         处理在后台线程执行，主线程保持响应（窗口可拖动、日志实时刷新）。
         """
+        # 重入守卫：控件禁用状态可能被用户中途操作绕开，这里做最终防线，
+        # 防止两个 worker 线程同时抢同一张 DWG、同一个日志区和进度条
+        if _busy['on']:
+            print("⚠️ 已有处理任务在运行，请等待本次处理结束。")
+            return
         folder = folder_path.get() if source_type.get() == 'folder' else None
         docx = tuple(docx_paths_ref) if source_type.get() == 'docx' else ()
         dwg = dwg_path.get()
@@ -458,18 +562,8 @@ def _create_main_window():
         # 解析失败或留空时保留原默认值，仅打印警告
         _apply_params()
         # 禁用所有控件，防止处理过程中误操作
+        _set_controls_enabled(False)
         start_btn.config(state=tk.DISABLED, text="处理中...")
-        browse_btn.config(state=tk.DISABLED)
-        for child in top.winfo_children():
-            try:
-                child.config(state=tk.DISABLED)
-            except tk.TclError:
-                pass
-        for child in param_frame.winfo_children():
-            try:
-                child.config(state=tk.DISABLED)
-            except tk.TclError:
-                pass
         root.update_idletasks()
 
         def _worker():
@@ -480,46 +574,66 @@ def _create_main_window():
             try:
                 batch_process(folder, docx, dwg, root)
             except Exception as e:
-                print(f"\n💥 程序异常终止: {e}")
+                # 用 print 而非 traceback.print_exc()：后者写 sys.stderr，
+                # 而 --windowed 打包后 sys.stderr 可能为 None，会在异常处理里再抛一次
                 import traceback
-                traceback.print_exc()
+                print(f"\n💥 程序异常终止: {e}")
+                print(traceback.format_exc())
             finally:
                 # 恢复 UI 必须在主线程（tkinter 非线程安全）
-                if _LOG_REDIRECTOR is not None:
-                    _LOG_REDIRECTOR.run_on_main(_restore_ui)
-                else:
-                    _restore_ui()
+                try:
+                    if _LOG_REDIRECTOR is not None:
+                        _LOG_REDIRECTOR.run_on_main(_restore_ui)
+                    else:
+                        _restore_ui()
+                except RuntimeError:
+                    pass  # 主窗已关闭，无需也无法恢复 UI
+                except Exception as e:
+                    # 恢复失败会让控件永久卡在禁用状态，必须让用户看到原因而不是静默吞掉
+                    import traceback
+                    print(f"⚠️ 恢复界面状态失败: {e}")
+                    print(traceback.format_exc())
+                # 与 CoInitialize 配对释放，避免多轮处理累积泄漏 COM 单元
+                pythoncom.CoUninitialize()
 
+        _busy['on'] = True
         threading.Thread(target=_worker, daemon=True).start()
 
     def _apply_params():
-        """读取参数 Entry/Combobox，按声明类型转换并更新模块级常量。
-        留空或解析失败时保留原默认值，仅打印警告。"""
+        """读取参数 Entry/Combobox，按声明类型转换、校验后更新模块级常量。
+        留空或校验不通过时保留原默认值，仅打印警告。"""
         module_globals = globals()
         for name, var in param_vars.items():
             raw = var.get().strip()
             if not raw:
                 continue
             ptype = param_types[name]
+            old = module_globals.get(name)
             try:
                 if ptype == 'color':
                     # 颜色：从中文名查 ACI 索引
                     new_val = _NAME_TO_ACI.get(raw)
                     if new_val is None:
-                        raise ValueError(f"未知颜色名: {raw}")
+                        raise ValueError("未知颜色名")
                 elif ptype is str:
                     new_val = raw
+                    if name.startswith('LAYER_'):
+                        bad = _LAYER_ILLEGAL_CHARS & set(new_val)
+                        if bad:
+                            raise ValueError(f"图层名不能包含 {' '.join(sorted(bad))}")
                 else:
                     new_val = ptype(raw)
-                old = module_globals.get(name)
+                    # 半径为 0 会画出不可见圆；文字高度为 0 会让 AddText 直接抛异常
+                    rng = _param_ranges.get(name)
+                    if rng is not None and not (rng[0] < new_val <= rng[1]):
+                        raise ValueError(f"需满足 {rng[0]} < 值 <= {rng[1]}")
                 if new_val != old:
                     module_globals[name] = new_val
                     # 颜色项额外显示 ACI 与颜色名，便于核对
                     display = f"{new_val}({_ACI_TO_NAME.get(new_val, '?')})" if ptype == 'color' else new_val
                     print(f"⚙️ 参数已更新: {name} = {display}（默认 {old}）")
-            except (ValueError, TypeError):
-                old = module_globals.get(name)
-                print(f"⚠️ 参数 {name}='{raw}' 解析失败（类型 {ptype}），保留默认 {old}")
+            except (ValueError, TypeError) as e:
+                print(f"⚠️ 参数 {name}='{raw}' 不合法（{e}），保留默认 {old}")
 
     _update_browse_state()
     root.update()
@@ -535,7 +649,11 @@ def _trunc3(x):
     """
     s = f"{float(x):.10f}"
     dot = s.index('.')
-    return s[:dot + 4]
+    s = s[:dot + 4]
+    # 负高程加上负偏移后可能截断成 "-0.000"，去掉无意义的负号
+    if s.startswith('-') and float(s) == 0:
+        s = s[1:]
+    return s
 
 
 def _get_ocr_engine():
@@ -592,12 +710,51 @@ def _normalize_ocr_text(text):
 
 def _ocr_to_text(img):
     result = _get_ocr_engine()(img)
+    # RapidOCR 3.x 返回 RapidOCROutput（dataclass，字段 boxes/txts）。若上游改了返回
+    # 结构，getattr 会静默取到 None，表现为"每张图都识别失败"却毫无报错，极难定位，
+    # 因此这里显式检查属性是否存在——缺属性说明是引擎层面故障而非单图识别失败。
+    if not (hasattr(result, 'txts') and hasattr(result, 'boxes')):
+        raise _OCREngineError(
+            f"OCR 返回结构异常（{type(result).__name__}，缺少 txts/boxes），"
+            "请检查 requirements.txt 中 rapidocr 的版本约束"
+        )
     return _normalize_ocr_text("\n".join(_reading_order_texts(result)))
 
 
-def _coords_from_text(text):
-    all_numbers = re.findall(r"-?\d+\.\d+", text)
-    return [n for n in all_numbers if abs(float(n)) > 100]
+def _decimal_numbers(text):
+    """按出现顺序返回文本中所有带小数点的数字（字符串形式）。
+
+    不做量级过滤：高程可能只有几十（只要大于 0），过滤会把它丢掉，
+    导致后续"取最后三个数"整体错位。量级判断交给 _split_coords。
+    """
+    return re.findall(r"-?\d+\.\d+", text)
+
+
+def _split_coords(numbers):
+    """从数字列表尾部解析出 (东坐标, 北坐标, 高程)，无法判定时返回 None。
+
+    仪器屏幕自上而下的顺序是 平距 -> 高差 -> 东坐标 -> 北坐标 -> 高程，
+    因此取最后三个数：末位是高程，其前两位依次是北坐标、东坐标。
+
+    只按位置取数是不够的：屏幕上若多出一个小数（如换页残留、OCR 误识的
+    杂值），末位就会被误当成高程，整体错位后画出错误的点。因此额外校验
+    高程与坐标的量级；不通过时返回 None，让调用方按"识别失败"处理——
+    画错点比不画更危险。
+    """
+    if len(numbers) < 3:
+        return None
+    try:
+        easting = float(numbers[-3])
+        northing = float(numbers[-2])
+        elevation = float(numbers[-1])
+    except (TypeError, ValueError):
+        return None
+
+    if not 0 < elevation < COORD_MIN_MAGNITUDE:
+        return None
+    if abs(easting) < COORD_MIN_MAGNITUDE or abs(northing) < COORD_MIN_MAGNITUDE:
+        return None
+    return easting, northing, elevation
 
 
 # 备注解析：位置后缀关键词
@@ -673,7 +830,7 @@ def extract_coords(image_path):
     """从单张图片中提取坐标。
 
     仪器屏幕的数值排列顺序为：东坐标 -> 北坐标 -> 高程，
-    因此取筛选后最后三个数依次作为 东坐标、北坐标、高程。
+    因此取最后三个数依次作为 东坐标、北坐标、高程（详见 _split_coords）。
     """
     try:
         img = _load_bgr(image_path)
@@ -681,44 +838,55 @@ def extract_coords(image_path):
             return {"文件名": os.path.basename(image_path), "东坐标": "识别失败",
                     "北坐标": "图片无法读取或已损坏", "高程": "识别失败"}
 
-        best_numbers = []
+        # 先用原图识别；结果不可信（数量不足或校验不通过）时再用放大锐化图重试
+        coords = None
         for candidate in (img, _enhance_for_blur(img)):
-            valid_coords = _coords_from_text(_ocr_to_text(candidate))
-            if len(valid_coords) >= 3:
-                best_numbers = valid_coords
+            coords = _split_coords(_decimal_numbers(_ocr_to_text(candidate)))
+            if coords is not None:
                 break
-            if len(valid_coords) > len(best_numbers):
-                best_numbers = valid_coords
 
-        if len(best_numbers) >= 3:
+        if coords is not None:
+            easting, northing, elevation = coords
             return {
                 "文件名": os.path.basename(image_path),
-                "东坐标": _trunc3(best_numbers[-3]),
-                "北坐标": _trunc3(best_numbers[-2]),
-                "高程": _trunc3(best_numbers[-1])
+                "东坐标": _trunc3(easting),
+                "北坐标": _trunc3(northing),
+                "高程": _trunc3(elevation),
             }
         return {"文件名": os.path.basename(image_path), "东坐标": "识别失败", "北坐标": "识别失败",
                 "高程": "识别失败"}
 
+    except _OCREngineError:
+        raise  # 引擎级故障：中断整轮处理，避免每张图重复记录同一条根因
     except Exception as e:
         return {"文件名": os.path.basename(image_path), "东坐标": f"报错: {e}", "北坐标": "",
                 "高程": ""}
 
 
 def _ensure_layer(doc, layer_name):
-    """获取指定图层，不存在则自动创建"""
+    """获取指定图层，不存在则自动创建。
+
+    Item 可能因 AutoCAD 忙被瞬态拒绝，紧接着的 Add 又会以"图层已存在"失败，
+    因此 Add 失败后再取一次 Item 兜底；两次都失败才真正抛出。
+    """
     try:
         return doc.Layers.Item(layer_name)
     except Exception:
+        pass
+    try:
         return doc.Layers.Add(layer_name)
+    except Exception:
+        return doc.Layers.Item(layer_name)
 
 
 def _is_com_call_rejected(exc):
     """判断异常是否为可重试的瞬态 COM 错误。
 
-    AutoCAD 处于忙状态（重绘、用户操作或对话框处理）时会拒绝 COM 调用，
-    短暂等待后重试通常即可成功。win32com 还可能偶发地把属性解析为方法，
-    抛 "Property 'X' can not be set" —— 同样可通过 retry 恢复。
+    AutoCAD 处于忙状态（重绘、打开图纸、用户操作或对话框处理）时会拒绝 COM 调用，
+    短暂等待后重试通常即可成功。识别三种表现形式：
+      - RPC_E_CALL_REJECTED / RPC_E_SERVERCALL_RETRYLATER（有明确 hresult）
+      - win32com 偶发地把属性解析为方法："Property 'X' can not be set"
+      - 晚绑定拿不到类型信息时的成员名报错："<unknown>.Layers"
     """
     hr = None
     if hasattr(exc, 'hresult'):
@@ -737,7 +905,75 @@ def _is_com_call_rejected(exc):
     msg = str(exc)
     if "can not be set" in msg:
         return True
+    # 晚绑定时 pywin32 拿不到类型信息，成员名解析失败的报错会被格式化成
+    # "<unknown>.Layers" 或 "AddText.Update" 这类 "对象名.成员名" 文本
+    # （本项目实测出现在 AutoCAD 忙、拒绝 COM 调用时）。
+    # 这种形式取不到有意义的 hresult，只能按文本判断。
+    # 若真是"成员不存在"，重试几次后仍会以同样的错误失败，代价只是几秒等待。
+    if msg.startswith("<unknown>."):
+        return True
+    # 匹配 "ClassName.MemberName" 形式（如 "AddText.Update"、"AddCircle.color"），
+    # 这些都是 win32com 晚绑定拿不到类型信息时的典型报错格式
+    import re
+    if re.match(r'^[A-Z][A-Za-z0-9_]*\.[A-Za-z0-9_]+$', msg):
+        return True
     return False
+
+
+def _com_wait(seconds):
+    """在当前 STA 线程内等待指定秒数，期间持续泵送消息队列。
+
+    AutoCAD 忙时对被拒的调用需要调用方重新发起才可能成功，而 STA 线程长时间
+    不泵消息也会让排队中的调用得不到处理。这里按 COM 的常规做法边等待边
+    PumpWaitingMessages，避免单纯 sleep 把消息处理一起阻塞掉。
+    """
+    deadline = time.time() + seconds
+    while True:
+        try:
+            pythoncom.PumpWaitingMessages()
+        except Exception:
+            # 非 STA 线程或消息过滤器异常：退化为纯等待，不影响功能
+            pass
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.05, remaining))
+
+
+def _wait_until_ready(doc, timeout=10.0):
+    """等待 AutoCAD 完成图纸激活/重生成；未就绪则抛出最后一次拒绝异常。
+
+    打开或激活图纸后 AutoCAD 仍会忙一段时间（大图纸重生成更久，人工操作或
+    弹出的对话框也会挡在前面），期间所有 COM 调用都被拒绝。原先固定睡 1 秒
+    并不可靠——大图纸上绘制阶段的第一个调用就会撞上忙窗口。
+    这里用一个轻量属性读取探测就绪，就绪即返回；非瞬态错误立即抛出；
+    超时则把最后一次拒绝抛给调用方，由其重试逻辑处理。
+    """
+    deadline = time.time() + timeout
+    last_err = None
+    while True:
+        try:
+            doc.Name  # 轻量读取：能成功即说明 AutoCAD 已可响应
+            return
+        except Exception as e:
+            if not _is_com_call_rejected(e):
+                raise
+            last_err = e
+        if time.time() >= deadline:
+            print(f"   ⚠️ AutoCAD 等待 {timeout:.0f} 秒仍未就绪，重试中...")
+            raise last_err
+        _com_wait(COM_RETRY_DELAY)
+
+
+def _preflight_draw_env(doc):
+    """绘制前预检：确认图层可创建、文字样式存在。
+
+    参数不合法时若等到逐点绘制才暴露，每个点都要重试满 COM_RETRY_ATTEMPTS 次，
+    成百个点会白白空转数分钟，因此提前一次性报出。
+    """
+    _ensure_layer(doc, LAYER_CIRCLE)
+    _ensure_layer(doc, LAYER_TEXT)
+    doc.TextStyles.Item(TEXT_STYLE)
 
 
 def _draw_on_doc(doc, points):
@@ -745,10 +981,27 @@ def _draw_on_doc(doc, points):
 
     points: [(东坐标X, 北坐标Y, 高程, 后缀, 文件名), ...]
     返回 (成功数量, 失败列表[(文件名, 失败原因)])。
-    单个点绘制失败不影响其他点；若圆已画出但文字失败，会删除该圆保持整组回滚。
+    单个点绘制失败不影响其他点；若圆或文字只画出一半，会把已创建的图元
+    一并删除，保持整组回滚，避免图上留下没有标注的孤圆或孤立文字。
     """
-    _ensure_layer(doc, LAYER_CIRCLE)
-    _ensure_layer(doc, LAYER_TEXT)
+    # 绘制前的第一次 COM 接触最容易撞上 AutoCAD 忙窗口（被 RPC_E_CALL_REJECTED
+    # 或以 "<unknown>.Layers" 形式拒绝）。原先这里没有任何重试，一次瞬态拒绝
+    # 就让整批坐标点全部失败，因此按与其他 COM 阶段一致的方式重试。
+    preflight_err = None
+    for attempt in range(COM_RETRY_ATTEMPTS):
+        try:
+            _preflight_draw_env(doc)
+            preflight_err = None
+            break
+        except Exception as e:
+            preflight_err = e
+            if _is_com_call_rejected(e) and attempt < COM_RETRY_ATTEMPTS - 1:
+                _com_wait(COM_RETRY_DELAY)
+                continue
+            break
+    if preflight_err is not None:
+        reason = str(preflight_err).replace('\n', ' ')[:200]
+        raise RuntimeError(f"绘图前无法访问图纸对象（AutoCAD 可能未响应）: {reason}")
 
     model_space = doc.ModelSpace
     drawn = 0
@@ -756,11 +1009,12 @@ def _draw_on_doc(doc, points):
     total_pts = len(points)
     for pi, (easting, northing, elevation, suffix, source_file) in enumerate(points):
         # AutoCAD 处于忙状态时会拒绝 COM 调用 (RPC_E_CALL_REJECTED)，
-        # 单个点的绘制流程作为 retry 单元：失败时清理半成品圆后短暂等待重试，
-        # 最多 5 次。非 RPC 拒绝错误直接记录失败不重试。
+        # 单个点的绘制流程作为 retry 单元：失败时清理半成品后短暂等待重试。
+        # 非 RPC 拒绝错误直接记录失败不重试。
         last_err = None
-        for attempt in range(5):
+        for attempt in range(COM_RETRY_ATTEMPTS):
             circle = None
+            text_obj = None
             try:
                 # ---- 红色圆（图层：长崖边巷道）----
                 center = win32com.client.VARIANT(
@@ -789,16 +1043,18 @@ def _draw_on_doc(doc, points):
                 last_err = None
                 break  # 成功，跳出 retry 循环
             except Exception as e:
-                # 圆已画出但后续失败：删除半成品圆，避免图上留下没有标注的圆
-                if circle is not None:
-                    try:
-                        circle.Delete()
-                    except Exception:
-                        pass
+                # 只成功了一半：把已创建的图元全部删除再重试，
+                # 否则失败点会在图上留下孤圆或孤立文字（文字可能先于圆之后创建成功）
+                for obj in (text_obj, circle):
+                    if obj is not None:
+                        try:
+                            obj.Delete()
+                        except Exception:
+                            pass
                 last_err = e
-                if _is_com_call_rejected(e) and attempt < 4:
-                    # RPC 调用被拒绝：短暂等待让 AutoCAD 处理完手头工作再 retry
-                    time.sleep(0.5)
+                if _is_com_call_rejected(e) and attempt < COM_RETRY_ATTEMPTS - 1:
+                    # RPC 调用被拒绝：泵消息等待 AutoCAD 处理完手头工作再 retry
+                    _com_wait(COM_RETRY_DELAY)
                     continue
                 # 非重试型错误（或已用尽重试次数）：直接记录失败
                 break
@@ -824,7 +1080,7 @@ def draw_circles_on_dwg(dwg_path, points):
     # 连接/打开图纸阶段也可能因 AutoCAD 忙被拒（RPC_E_CALL_REJECTED），
     # 整体包在 retry 循环内；非瞬态错误立即抛出
     last_err = None
-    for attempt in range(5):
+    for attempt in range(COM_RETRY_ATTEMPTS):
         try:
             # 连接（或启动）AutoCAD
             acad = win32com.client.Dispatch("AutoCAD.Application")
@@ -852,7 +1108,7 @@ def draw_circles_on_dwg(dwg_path, points):
                             break
                     except Exception:
                         pass
-                    time.sleep(1)
+                    _com_wait(1.0)
                 if doc is None:
                     for open_doc in acad.Documents:
                         try:
@@ -861,28 +1117,37 @@ def draw_circles_on_dwg(dwg_path, points):
                                 break
                         except Exception:
                             continue
+            # doc 仍为 None 时若继续调用 doc.Activate()，抛出的只是
+            # "'NoneType' object has no attribute 'Activate'"，用户完全看不出
+            # 是图纸打开超时，这里换成带业务含义的报错
+            if doc is None:
+                raise RuntimeError(
+                    f"打开图纸超时（60 秒内未完成）：{os.path.basename(abs_dwg)}。"
+                    "请确认文件未被占用、路径可访问，且 AutoCAD 未弹出对话框等待响应。"
+                )
             doc.Activate()
-            # 连接/打开成功后短暂等待 AutoCAD 完成初始化（尤其是程序刚启动 CAD 的场景），
-            # 减少后续绘图阶段 RPC_E_CALL_REJECTED 的概率
-            time.sleep(1.0)
+            # 等待 AutoCAD 完成激活/重生成再进入绘制。原先固定睡 1 秒不够：
+            # 大图纸激活后仍在忙，绘制阶段的第一个 COM 调用就会撞上忙窗口被拒绝
+            _wait_until_ready(doc)
             break  # 连接+打开成功，跳出 retry 循环
         except Exception as e:
             last_err = e
             if _is_com_call_rejected(e):
-                # AutoCAD 忙，等 0.5s 后重试
-                time.sleep(0.5)
+                # AutoCAD 忙，等待后重试
+                _com_wait(COM_RETRY_DELAY)
                 continue
             raise  # 非瞬态错误直接抛出
     else:
-        # 5 次重试都被拒绝，抛出最后一次异常
+        # 全部重试都被拒绝，抛出最后一次异常
         raise last_err
 
     drawn, failed = _draw_on_doc(doc, points)
 
     # 视图缩放到本次成功绘制的区域（外扩 ZOOM_MARGIN 米），而不是整张图，
     # 避免 ZoomExtents 把大坐标图纸缩得过小、难以确认刚绘制的点
-    success_points = [pt for pt in points
-                      if pt[3] not in {name for name, _ in failed}]
+    # 注意 points 元素为 (东, 北, 高程, 后缀, 文件名)，文件名是下标 4
+    failed_names = {name for name, _ in failed}
+    success_points = [pt for pt in points if pt[4] not in failed_names]
     if success_points:
         xs = [pt[0] for pt in success_points]
         ys = [pt[1] for pt in success_points]
@@ -897,13 +1162,13 @@ def draw_circles_on_dwg(dwg_path, points):
         )
         # ZoomWindow 同样可能被 AutoCAD 拒绝（RPC_E_CALL_REJECTED），加 retry；
         # 失败时仅打印警告不抛出异常——前面已成功绘制的圆和文字标注不受影响
-        for attempt in range(3):
+        for attempt in range(COM_ZOOM_ATTEMPTS):
             try:
                 acad.ZoomWindow(lower, upper)
                 break
             except Exception as e:
-                if _is_com_call_rejected(e) and attempt < 4:
-                    time.sleep(0.5)
+                if _is_com_call_rejected(e) and attempt < COM_ZOOM_ATTEMPTS - 1:
+                    _com_wait(COM_RETRY_DELAY)
                     continue
                 # 重试用尽或非重试错误：缩放失败不影响已绘制内容
                 print(f"   ⚠️ 视图缩放失败（已绘制内容不受影响）: {e}")
@@ -915,15 +1180,23 @@ def archive_failed_images(folder_path, failures):
     """把失败图片复制到照片目录下带时间戳的新文件夹，并写入失败原因清单。
 
     failures: [(图片完整路径, 文件名, 失败原因), ...]
-    返回归档文件夹路径（无失败项时返回 None）。
+    返回归档文件夹路径；无失败项或归档不可用时返回 None。
+
+    归档只是"方便人工复查"的附带动作，不应中断整轮处理：目录只读、网络盘掉线、
+    磁盘写满等都会让这里抛异常，若冒泡出去会导致用户连汇总弹窗都看不到，
+    因此内部异常一律降级为警告。
     """
-    if not failures:
+    if not failures or not folder_path:
         return None
 
     archive_dir = os.path.join(
         folder_path, f"识别失败图片_{datetime.now():%Y%m%d_%H%M%S}"
     )
-    os.makedirs(archive_dir, exist_ok=True)
+    try:
+        os.makedirs(archive_dir, exist_ok=True)
+    except Exception as e:
+        print(f"   ⚠️ 无法创建失败归档目录（{archive_dir}）: {e}")
+        return None
 
     used_names = set()
     for full_path, filename, reason in failures:
@@ -939,13 +1212,16 @@ def archive_failed_images(folder_path, failures):
             print(f"   ⚠️ 复制失败图片出错: {filename} -> {e}")
 
     # 写出失败原因清单，便于后续人工分析
-    log_path = os.path.join(archive_dir, "失败原因.txt")
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write(f"生成时间: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
-        f.write(f"失败数量: {len(failures)}\n")
-        f.write("=" * 60 + "\n")
-        for _, filename, reason in failures:
-            f.write(f"{filename}\t{reason}\n")
+    try:
+        log_path = os.path.join(archive_dir, "失败原因.txt")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"生成时间: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+            f.write(f"失败数量: {len(failures)}\n")
+            f.write("=" * 60 + "\n")
+            for _, filename, reason in failures:
+                f.write(f"{filename}\t{reason}\n")
+    except Exception as e:
+        print(f"   ⚠️ 写入失败原因清单出错: {e}")
 
     return archive_dir
 
@@ -965,10 +1241,16 @@ def extract_images_from_docx(docx_path, output_dir):
     """
     from docx import Document
     from docx.oxml.ns import qn
+    import hashlib
 
     doc_base = os.path.splitext(os.path.basename(docx_path))[0]
+    # 不同目录下可能有同名 docx（如两份"图片备忘.doc"），仅用文档名做前缀会让
+    # 后一个文档的图片覆盖前一个，这里附加路径哈希保证跨文档唯一
+    doc_tag = hashlib.md5(os.path.abspath(docx_path).encode('utf-8')).hexdigest()[:6]
 
-    # 内容类型到扩展名的映射
+    # 内容类型到扩展名的映射：只收 OCR 能解码的位图。
+    # emf/wmf 是 Word 里常见的矢量图，cv2 无法解码，提取出来只会变成
+    # 一条"图片无法读取"的失败记录，因此不收。
     ext_map = {
         'image/png': '.png',
         'image/jpeg': '.jpg',
@@ -976,22 +1258,29 @@ def extract_images_from_docx(docx_path, output_dir):
         'image/gif': '.gif',
         'image/bmp': '.bmp',
         'image/tiff': '.tiff',
-        'image/x-emf': '.emf',
-        'image/x-wmf': '.wmf',
     }
     # zip 内扩展名到 content_type 的反向映射（回退模式用）
     zip_ext_map = {
         '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
         '.gif': 'image/gif', '.bmp': 'image/bmp', '.tiff': 'image/tiff',
-        '.emf': 'image/x-emf', '.wmf': 'image/x-wmf',
     }
 
     def _save_image(blob, content_type, idx, note):
-        ext = ext_map.get(content_type, '.png')
-        filename = f"{doc_base}_{idx:03d}{ext}"
+        """保存一张图片，返回 (路径, 文件名, 备注)；不支持的格式返回 None。"""
+        ext = ext_map.get(content_type)
+        if ext is None:
+            # 不谎报成 .png：下游会按扩展名判断格式，错的扩展名会让问题更隐蔽
+            print(f"   ⚠️ 跳过不支持的图片类型 {content_type}"
+                  f"（{os.path.basename(docx_path)} 第 {idx} 张）")
+            return None
+        filename = f"{doc_base}_{doc_tag}_{idx:03d}{ext}"
         save_path = os.path.join(output_dir, filename)
-        with open(save_path, 'wb') as f:
-            f.write(blob)
+        try:
+            with open(save_path, 'wb') as f:
+                f.write(blob)
+        except Exception as e:
+            print(f"   ⚠️ 保存图片失败 {filename}: {e}")
+            return None
         return (save_path, filename, note)
 
     # ---- 策略1：python-docx 遍历段落（保留顺序、解析备注）----
@@ -1023,7 +1312,9 @@ def extract_images_from_docx(docx_path, output_dir):
                     idx += 1
                     # 同段第二张及之后的图不重复挂载备注（避免一份备注被多张图误用）
                     note = note_for_first if bi == 0 else ''
-                    extracted.append(_save_image(part.blob, part.content_type, idx, note))
+                    saved = _save_image(part.blob, part.content_type, idx, note)
+                    if saved is not None:
+                        extracted.append(saved)
                 # 段内若同时有文字，文字视为对该段图片的说明，不当作下一张图的备注
             elif para_text:
                 # 纯文字段落：作为备注候选加入缓冲区
@@ -1119,7 +1410,9 @@ def extract_images_from_docx(docx_path, output_dir):
                         content_type = zip_ext_map[ext]
                         idx += 1
                         note = note_for_first if bi == 0 else ''
-                        extracted.append(_save_image(blob, content_type, idx, note))
+                        saved = _save_image(blob, content_type, idx, note)
+                        if saved is not None:
+                            extracted.append(saved)
                 elif para_text:
                     pending_notes.append(para_text)
 
@@ -1132,7 +1425,7 @@ def extract_images_from_docx(docx_path, output_dir):
 
 
 def batch_process(folder_path, docx_paths, dwg_path, root):
-    """批量处理主程序：OCR 识别坐标 -> 在指定 DWG 上绘制红色圆
+    """批量处理主程序入口：负责 docx 提取临时目录的创建与清理。
 
     图片来源支持两种：
     1. 一个文件夹内的所有图片
@@ -1144,6 +1437,18 @@ def batch_process(folder_path, docx_paths, dwg_path, root):
     dwg_path: 目标 DWG 文件路径
     root: 主窗口引用（用作 messagebox.parent）
     """
+    temp_dir = tempfile.mkdtemp(prefix='autodraw_docx_') if docx_paths else None
+    try:
+        _batch_process_inner(folder_path, docx_paths, dwg_path, root, temp_dir)
+    finally:
+        # 正常返回或中途抛异常（含 OCR 引擎级故障）都要清掉临时目录，
+        # 否则提取出的图片会在系统临时目录里不断累积
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _batch_process_inner(folder_path, docx_paths, dwg_path, root, temp_dir):
+    """批处理主体。temp_dir 由 batch_process 创建，并在其 finally 中统一清理。"""
     print(f"AutoDraw 启动")
     print(f"图片来源: {'文件夹' if folder_path else 'Word文档'} | DWG: {os.path.basename(dwg_path)}")
     print("=" * 50)
@@ -1155,16 +1460,20 @@ def batch_process(folder_path, docx_paths, dwg_path, root):
     #    先收集文件夹内图片，再提取 docx 内图片
     supported_formats = ('.png', '.jpg', '.jpeg', '.bmp')
     image_list = []   # [(完整路径, 显示文件名, 备注字符串), ...]
-    temp_dir = None   # docx 提取图片的临时目录，结束时清理
 
     if folder_path:
-        for filename in sorted(os.listdir(folder_path)):
+        try:
+            filenames = sorted(os.listdir(folder_path))
+        except OSError as e:
+            # 文件夹被删除/无访问权限时给出可读原因，而不是让整轮处理崩在入口
+            print(f"⚠️ 无法读取图片文件夹 {folder_path}: {e}")
+            return
+        for filename in filenames:
             if filename.lower().endswith(supported_formats):
                 image_list.append((os.path.join(folder_path, filename), filename, ''))
         print(f"\n📁 文件夹图片：{len(image_list)} 张")
 
     if docx_paths:
-        temp_dir = tempfile.mkdtemp(prefix='autodraw_docx_')
         for docx_path in docx_paths:
             try:
                 imgs = extract_images_from_docx(docx_path, temp_dir)
@@ -1176,8 +1485,6 @@ def batch_process(folder_path, docx_paths, dwg_path, root):
 
     if not image_list:
         print("\n⚠️ 未收集到任何图片，程序结束。")
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
         return
 
     print(f"\n🚀 共收集 {len(image_list)} 张图片，开始识别...\n{'=' * 50}")
@@ -1209,8 +1516,8 @@ def batch_process(folder_path, docx_paths, dwg_path, root):
                 if parsed:
                     offset, suffix = parsed
                     elevation_new = elevation + offset
-                    print(f"   � 备注: {note}")
-                    print(f"   �� 应用备注: 高程 {_trunc3(elevation)} + ({_trunc3(offset)}) = {_trunc3(elevation_new)}, 标注: {_trunc3(elevation_new)}{suffix}")
+                    print(f"   📝 备注: {note}")
+                    print(f"   🔧 应用备注: 高程 {_trunc3(elevation)} + ({_trunc3(offset)}) = {_trunc3(elevation_new)}, 标注: {_trunc3(elevation_new)}{suffix}")
                     elevation = elevation_new
                 else:
                     # 不可解析的备注（如纯"中顶"），仅显示备注本身
@@ -1244,8 +1551,6 @@ def batch_process(folder_path, docx_paths, dwg_path, root):
             msg += f"\n失败图片已保存至:\n{archive_dir}"
         print(msg)
         _msg(messagebox.showwarning, "处理完成（无有效坐标）", msg, root)
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
         return
 
     # 7. 打开 DWG 并绘制红色圆
@@ -1262,8 +1567,9 @@ def batch_process(folder_path, docx_paths, dwg_path, root):
         print(f"❌ AutoCAD 绘图失败: {e}")
         print("请确认本机已安装 AutoCAD，且 DWG 文件未被其他程序独占占用。")
         # CAD 整体不可用：所有待绘图片都按绘制失败归档
+        # 原因不只可能是连接失败（也可能是图层名/文字样式预检不通过），故用中性描述
         draw_failed = [
-            (pt[4], f"AutoCAD连接/打开图纸失败: {cad_fatal[:150]}")
+            (pt[4], f"AutoCAD 绘图失败: {cad_fatal[:150]}")
             for pt in valid_points
         ]
 
@@ -1299,10 +1605,7 @@ def batch_process(folder_path, docx_paths, dwg_path, root):
         else:
             _msg(messagebox.showinfo, "处理完成", msg, root)
 
-    # 清理 docx 临时提取目录（失败图片已复制到归档目录，原临时文件可删）
-    if temp_dir:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
+    # 清理 docx 临时提取目录的工作已在 batch_process 的 finally 中统一完成
     _set_progress(1.0)  # 处理完成，进度 100%
 
 
