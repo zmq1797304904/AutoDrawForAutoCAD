@@ -56,6 +56,11 @@ _LAYER_ILLEGAL_CHARS = set('<>/\\":;?*|=,')
 # 因此用 1e4 把高程与平距/高差之类的小数值同坐标区分开。
 COORD_MIN_MAGNITUDE = 1e4
 
+# 带带号的高斯-克吕格东坐标量级（如 37 带：37 479 487），必定 ≥ 1e7；
+# 中国境内的北坐标（纬度 ≤ 54°）最大约 6e6，永远达不到这个量级。
+# 两者同屏时，大数必为东坐标，可作为与标签顺序无关的判定依据。
+COORD_ZONE_THRESHOLD = 1e7
+
 APP_USER_MODEL_ID = 'AutoDraw.AutoCAD.CoordinateTool'  # 任务栏归组与图标标识
 
 # AutoCAD 颜色索引 (ACI) 到中文名映射，用于窗体下拉框显示；256=ByLayer（随图层）
@@ -730,30 +735,56 @@ def _decimal_numbers(text):
     return re.findall(r"-?\d+\.\d+", text)
 
 
-def _split_coords(numbers):
+def _axis_order_from_text(text):
+    """从 OCR 文本中提取坐标轴标签的先后顺序，如 ['X','Y','Z'] 或 ['Y','X','Z']。
+
+    全站仪屏幕不同型号的排列不同：有的先 X(北) 后 Y(东)，有的先 Y 后 X。
+    RapidOCR 常把三个标签合并成一个 token（"XYZ"、"YXZ"），也可能只识别出
+    其中一两个字母，因此逐行扫描，取首个同时含 X 和 Y 的行。找不到返回 None，
+    由 _split_coords 用量级判定。
+    """
+    for line in text.splitlines():
+        letters = [ch for ch in line.upper() if ch in 'XYZ']
+        if 'X' in letters and 'Y' in letters:
+            return letters
+    return None
+
+
+def _split_coords(numbers, axis_order=None):
     """从数字列表尾部解析出 (东坐标, 北坐标, 高程)，无法判定时返回 None。
 
-    仪器屏幕自上而下的顺序是 平距 -> 高差 -> 东坐标 -> 北坐标 -> 高程，
-    因此取最后三个数：末位是高程，其前两位依次是北坐标、东坐标。
+    屏幕数值的顺序因仪器版式而异（旧版 平距 -> 高差 -> Y(东) -> X(北) -> Z，
+    新版 X(北) -> Y(东) -> Z），所以不能按固定位置认定东/北，必须判定：
+      1. 两数中有一个 ≥ 1e7：带带号的高斯-克吕格东坐标，量级可直接区分；
+      2. 否则按屏幕标签顺序：标签 Y = 东坐标，标签 X = 北坐标
+         （测绘惯例：高斯-克吕格横轴 Y 为东坐标，纵轴 X 为北坐标）；
+      3. 两者都判不出时返回 None，宁可不画也不能画错点。
 
-    只按位置取数是不够的：屏幕上若多出一个小数（如换页残留、OCR 误识的
-    杂值），末位就会被误当成高程，整体错位后画出错误的点。因此额外校验
-    高程与坐标的量级；不通过时返回 None，让调用方按"识别失败"处理——
-    画错点比不画更危险。
+    高程仍取末位，并校验量级，防止屏幕上多出一个小数导致整体错位。
     """
     if len(numbers) < 3:
         return None
     try:
-        easting = float(numbers[-3])
-        northing = float(numbers[-2])
+        a = float(numbers[-3])
+        b = float(numbers[-2])
         elevation = float(numbers[-1])
     except (TypeError, ValueError):
         return None
 
     if not 0 < elevation < COORD_MIN_MAGNITUDE:
         return None
-    if abs(easting) < COORD_MIN_MAGNITUDE or abs(northing) < COORD_MIN_MAGNITUDE:
+    if abs(a) < COORD_MIN_MAGNITUDE or abs(b) < COORD_MIN_MAGNITUDE:
         return None
+
+    if abs(a) >= COORD_ZONE_THRESHOLD or abs(b) >= COORD_ZONE_THRESHOLD:
+        easting, northing = (a, b) if abs(a) > abs(b) else (b, a)
+    else:
+        order = [ax for ax in (axis_order or []) if ax in ('X', 'Y')]
+        if len(order) != 2 or order[0] == order[1]:
+            return None
+        # 屏幕标签 Y=东坐标 -> CAD 的 X；X=北坐标 -> CAD 的 Y
+        easting, northing = (a, b) if order[0] == 'Y' else (b, a)
+
     return easting, northing, elevation
 
 
@@ -829,8 +860,8 @@ def _parse_elevation_note(text):
 def extract_coords(image_path):
     """从单张图片中提取坐标。
 
-    仪器屏幕的数值排列顺序为：东坐标 -> 北坐标 -> 高程，
-    因此取最后三个数依次作为 东坐标、北坐标、高程（详见 _split_coords）。
+    全站仪屏幕上的 X 是北坐标、Y 是东坐标（高斯-克吕格：横轴 Y=东，纵轴 X=北），
+    与 CAD 的 X=东、Y=北 相反，必须按标签/量级判定后转换（详见 _split_coords）。
     """
     try:
         img = _load_bgr(image_path)
@@ -841,7 +872,8 @@ def extract_coords(image_path):
         # 先用原图识别；结果不可信（数量不足或校验不通过）时再用放大锐化图重试
         coords = None
         for candidate in (img, _enhance_for_blur(img)):
-            coords = _split_coords(_decimal_numbers(_ocr_to_text(candidate)))
+            text = _ocr_to_text(candidate)
+            coords = _split_coords(_decimal_numbers(text), _axis_order_from_text(text))
             if coords is not None:
                 break
 
